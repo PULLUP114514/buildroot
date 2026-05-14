@@ -1,9 +1,15 @@
 config BR2_PACKAGE_LIBCEDARX
 	depends on BR2_PACKAGE_LIBCEDARC
-	depends on BR2_PACKAGE_OPENSSL
 	bool "libcedarx"
 	help
 		Allwinner CedarX is a middware to process multimedia content.
+
+config BR2_PACKAGE_LIBCEDARX_ARCHLIB
+	string "CedarX Arch library select"
+	default "openwrt-arm926-glibc"
+	help
+		see libcedarx/external
+
 
 comment "libcedarx needs libcedarc"
 	depends on !BR2_PACKAGE_LIBCEDARC

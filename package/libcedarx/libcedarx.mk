@@ -3,19 +3,29 @@
 # LIBCEDARX
 #
 ################################################################################
-LIBCEDARX_VERSION = 6215f1c9465d2f23f02930957a0bacdda0878bb1
+LIBCEDARX_VERSION = 92a060decd558cf7368c9df4fbfc472d22169fad
 LIBCEDARX_SITE = https://github.com/rhodesepass/libcedarx.git
 LIBCEDARX_SITE_METHOD = git
-LIBCEDARX_DEPENDENCIES = openssl libcedarc
+LIBCEDARX_DEPENDENCIES = libcedarc
 LIBCEDARX_INSTALL_STAGING = YES
 LIBCEDARX_INSTALL_TARGET = YES
 LIBCEDARX_AUTORECONF = YES
-LIBCEDARX_ARCHLIB = $(call qstrip,$(BR2_PACKAGE_LIBCEDARC_ARCHLIB))
+LIBCEDARX_ARCHLIB = $(call qstrip,$(BR2_PACKAGE_LIBCEDARX_ARCHLIB))
 LIBCEDARX_CONF_ENV = \
 	CFLAGS="$(TARGET_CFLAGS) -D__ENABLE_ZLIB__ -Wno-error=format-overflow -Wno-error=tautological-compare -Wno-error=format-truncation -Wno-error=maybe-uninitialized" \
 	CPPFLAGS="$(TARGET_CXXFLAGS) -D__ENABLE_ZLIB__ -Wno-error=format-overflow -Wno-error=tautological-compare -Wno-error=format-truncation -Wno-error=maybe-uninitialized" \
-	LDFLAGS="$(TARGET_LDFLAGS) -L$(@D)/external/lib32/$(LIBCEDARX_ARCHLIB) -L$(STAGING_DIR)/usr/lib -lcrypto -lz -lssl" 
-LIBCEDARX_CONF_OPTS =
+	LDFLAGS="$(TARGET_LDFLAGS) -L$(@D)/external/lib32/$(LIBCEDARX_ARCHLIB) -L$(STAGING_DIR)/usr/lib -lz" 
+LIBCEDARX_CONF_OPTS = \
+	--enable-file-stream \
+	--enable-mov-parser \
+	--enable-mkv-parser \
+	--enable-avi-parser \
+	--enable-ts-parser \
+	--enable-flv-parser \
+	--enable-id3v2-parser \
+	--enable-mpg-parser \
+	--enable-mp4-muxer \
+	--enable-ts-muxer
 LIBCEDARX_MAKE_ENV = 
 
 LIBCEDARX_INSTALL_STAGING_CMDS = $(TARGET_MAKE_ENV) $(MAKE) DESTDIR=$(STAGING_DIR) -C $(@D) install;

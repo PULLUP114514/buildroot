@@ -3,8 +3,9 @@
 # libcedarc
 #
 ################################################################################
-LIBCEDARC_VERSION = master
-LIBCEDARC_SITE = $(call github,aodzip,libcedarc,$(LIBCEDARC_VERSION))
+LIBCEDARC_VERSION = 2743780646589c21f43fe7c22890de3c91394912
+LIBCEDARC_SITE = https://github.com/rhodesepass/libcedarc.git
+LIBCEDARC_SITE_METHOD = git
 LIBCEDARC_DEPENDENCIES = 
 LIBCEDARC_INSTALL_STAGING = YES
 LIBCEDARC_INSTALL_TARGET = YES
@@ -28,6 +29,8 @@ LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libVE.so
 LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libVE.so' '$(HOST_DIR)/arm-buildroot-linux-gnueabi/sysroot/lib/';
 LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libvideoengine.so' '$(TARGET_DIR)/usr/lib/';
 LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libvideoengine.so' '$(HOST_DIR)/arm-buildroot-linux-gnueabi/sysroot/lib/';
+LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libscaledown.so' '$(TARGET_DIR)/usr/lib/';
+LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libscaledown.so' '$(HOST_DIR)/arm-buildroot-linux-gnueabi/sysroot/lib/';
 
 ifeq ($(BR2_PACKAGE_LIBCEDARC_DECODER_AVS),y)
 	LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libawavs.so' '$(TARGET_DIR)/usr/lib/';
@@ -70,10 +73,12 @@ ifeq ($(BR2_PACKAGE_LIBCEDARC_DECODER_WMV3),y)
 	LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libawwmv3.so' '$(TARGET_DIR)/usr/lib/';
 endif
 
-ifeq ($(BR2_PACKAGE_LIBCEDARC_ENCODER),y)
-	LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libvencoder.so' '$(TARGET_DIR)/usr/lib/';
-	LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libvencoder.so' '$(HOST_DIR)/arm-buildroot-linux-gnueabi/sysroot/lib/';
-endif
+
+# f1c100s no encoder
+# ifeq ($(BR2_PACKAGE_LIBCEDARC_ENCODER),y)
+# 	LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libvencoder.so' '$(TARGET_DIR)/usr/lib/';
+# 	LIBCEDARC_INSTALL_TARGET_CMDS += cp '$(@D)/library/$(LIBCEDARC_ARCHLIB)/libvencoder.so' '$(HOST_DIR)/arm-buildroot-linux-gnueabi/sysroot/lib/';
+# endif
 
 ifneq ($(BR2_PACKAGE_LIBCEDARC_OPENMAX),y)
 	LIBCEDARC_INSTALL_TARGET_CMDS += rm '$(TARGET_DIR)/usr/lib/libOmxCore.so';
