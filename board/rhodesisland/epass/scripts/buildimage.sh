@@ -8,7 +8,7 @@ fakeroot sh -c "rm ubi.img"
 mkdir rootfs
 
 echo "building rootfs..."
-fakeroot sh -c "tar xvf rootfs.tar -C rootfs/"
+fakeroot sh -c "tar xf rootfs.tar -C rootfs/"
 fakeroot sh -c 'mkfs.ubifs -x lzo -F -m 2048 -e 126976 -c 874 -o rootfs_ubifs.img -r rootfs'
 fakeroot sh -c 'ubinize -o rootfs_ubi.img -m 2048 -p 131072 -O 2048 -s 2048 ubinize-rootfs.cfg -v'
 
