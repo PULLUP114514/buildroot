@@ -1,37 +1,158 @@
 #!/bin/sh
 
-init_clean_gadget() {
-    start-stop-daemon -K -q -p /var/run/umtprd.pid -x /usr/sbin/umtprd 2>/dev/null
-    start-stop-daemon -K -q -p /var/run/getty.pid -x /sbin/getty 2>/dev/null
-    /sbin/ifdown -a
+CONFIGFS_DIR="${CONFIGFS_DIR:-/sys/kernel/config}"
+GADGET_NAME="${GADGET_NAME:-g1}"
+GADGET_ROOT="${CONFIGFS_DIR}/usb_gadget/${GADGET_NAME}"
 
-    if [ ! -d /sys/kernel/config/usb_gadget ]; then
-        mount -t configfs none /sys/kernel/config
+FFS_INSTANCE="${FFS_INSTANCE:-epass}"
+FFS_MOUNT="${FFS_MOUNT:-/dev/ffs-epass}"
+USB_RESPONDER="${USB_RESPONDER:-usb_responder}"
+RESPONDER_PIDFILE="${RESPONDER_PIDFILE:-/var/run/usb_responder.pid}"
+MS_VENDOR_CODE="${MS_VENDOR_CODE:-0xcd}"
+UDC_AUTO="${UDC_AUTO:-1}"
+USBCTL_MODE_FILE="${USBCTL_MODE_FILE:-/tmp/usbctl_mode}"
+
+UMTPRD_PID=/var/run/umtprd.pid
+GETTY_PID=/var/run/getty.pid
+
+have_ssd() {
+    command -v start-stop-daemon >/dev/null 2>&1
+}
+
+first_udc() {
+    # shellcheck disable=SC2012
+    ls /sys/class/udc/ 2>/dev/null | head -n 1 || true
+}
+
+mode_already() {
+    _want="$1"
+    if [ -f "$USBCTL_MODE_FILE" ]; then
+        IFS= read -r _cur < "$USBCTL_MODE_FILE" || _cur=
+        if [ "$_cur" = "$_want" ]; then
+            echo "$_want: already"
+            return 0
+        fi
     fi
-    if [ -d /sys/kernel/config/usb_gadget/g1 ]; then
-        echo > /sys/kernel/config/usb_gadget/g1/UDC
+    return 1
+}
+
+mode_set() {
+    echo "$1" > "$USBCTL_MODE_FILE" 2>/dev/null || true
+}
+
+mode_clear() {
+    rm -f "$USBCTL_MODE_FILE" 2>/dev/null || true
+}
+
+bind_udc() {
+    if [ "$UDC_AUTO" != "1" ]; then
+        echo "UDC_AUTO=0: echo <udc> > $GADGET_ROOT/UDC" >&2
+        return 2
+    fi
+    u="$(first_udc)"
+    if [ -z "$u" ]; then
+        echo "FAIL: no UDC" >&2
+        return 1
+    fi
+    echo "$u" > "$GADGET_ROOT/UDC" || {
+        echo "FAIL: UDC bind" >&2
+        return 1
+    }
+}
+
+udc_ok_or_fail() {
+    bind_udc
+    _b=$?
+    case "$_b" in
+        0) echo OK ;;
+        2) ;;
+        *) echo FAIL ;;
+    esac
+    case "$_b" in 0|2) return 0 ;; *) return 1 ;; esac
+}
+
+daemon_stop() {
+    _pf="$1"
+    _exe="$2"
+    if have_ssd; then
+        start-stop-daemon -K -q -p "$_pf" -x "$_exe" 2>/dev/null || true
+    elif [ -f "$_pf" ]; then
+        kill "$(cat "$_pf")" 2>/dev/null || true
+        rm -f "$_pf"
+    fi
+}
+
+daemon_start() {
+    _pf="$1"
+    _exe="$2"
+    shift 2
+    if have_ssd; then
+        start-stop-daemon -S -q -m -b -p "$_pf" -x "$_exe" -- "$@"
+    else
+        "$_exe" "$@" &
+        echo $! > "$_pf"
+    fi
+}
+
+gadget_full_stop() {
+    daemon_stop "$UMTPRD_PID" /usr/sbin/umtprd
+    daemon_stop "$GETTY_PID" /sbin/getty
+    daemon_stop "$RESPONDER_PIDFILE" "$USB_RESPONDER"
+
+    /sbin/ifdown -a 2>/dev/null || true
+
+    if [ -d "$GADGET_ROOT" ] && [ -f "$GADGET_ROOT/UDC" ]; then
+        echo "" > "$GADGET_ROOT/UDC" 2>/dev/null || true
         sleep 1
     fi
-    umount /dev/ffs-mtp 2>/dev/null
-    mkdir /sys/kernel/config/usb_gadget/g1
-    cd /sys/kernel/config/usb_gadget/g1
 
-    # remove all gadgets if any exist
+    umount /dev/ffs-mtp 2>/dev/null || true
+    umount "$FFS_MOUNT" 2>/dev/null || true
 
-    rm configs/c.1/ffs.mtp
-    rm configs/c.1/acm.usb0
-    rm configs/c.1/rndis.usb0
+    if [ -d "$GADGET_ROOT" ]; then
+        rm -f "$GADGET_ROOT"/os_desc/c.1 2>/dev/null || true
+        rm -f "$GADGET_ROOT"/configs/c.1/ffs.mtp 2>/dev/null || true
+        rm -f "$GADGET_ROOT"/configs/c.1/ffs."$FFS_INSTANCE" 2>/dev/null || true
+        rm -f "$GADGET_ROOT"/configs/c.1/acm.usb0 2>/dev/null || true
+        rm -f "$GADGET_ROOT"/configs/c.1/rndis.usb0 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/functions/ffs.mtp 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/functions/ffs."$FFS_INSTANCE" 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/functions/acm.usb0 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/functions/rndis.usb0 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/configs/c.1/strings/0x409 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/configs/c.1 2>/dev/null || true
+        rmdir "$GADGET_ROOT"/strings/0x409 2>/dev/null || true
+        rmdir "$GADGET_ROOT" 2>/dev/null || true
+    fi
+    if [ -d "$GADGET_ROOT" ]; then
+        rm -rf "$GADGET_ROOT" 2>/dev/null || true
+    fi
+    rmdir /dev/ffs-mtp 2>/dev/null || true
+    rmdir "$FFS_MOUNT" 2>/dev/null || true
+    mode_clear
+}
 
-    rmdir functions/ffs.mtp
-    rmdir functions/acm.usb0
-    rmdir functions/rndis.usb0
+ensure_configfs() {
+    if [ ! -d "$CONFIGFS_DIR/usb_gadget" ]; then
+        mount -t configfs none "$CONFIGFS_DIR" || {
+            echo "FAIL: configfs" >&2
+            return 1
+        }
+    fi
+}
 
-    mkdir configs/c.1
-    mkdir strings/0x409
-    mkdir configs/c.1/strings/0x409
+gadget_skeleton() {
+    ensure_configfs || return 1
+    gadget_full_stop
+    mkdir "$GADGET_ROOT" || {
+        echo "FAIL: mkdir gadget" >&2
+        return 1
+    }
+    cd "$GADGET_ROOT" || return 1
+
+    mkdir -p strings/0x409 configs/c.1/strings/0x409
 
     echo 0x1D6B > idVendor
-
     echo "Rhodes Island" > strings/0x409/manufacturer
     echo "Electric Pass" > strings/0x409/product
 
@@ -40,19 +161,22 @@ init_clean_gadget() {
 }
 
 mtp_start() {
-    if [ -d "/sys/kernel/config/usb_gadget/g1/configs/c.1/ffs.mtp" ]; then
-        echo "MTP already running."
-        return
+    mode_already mtp && return 0
+    if [ -d "$GADGET_ROOT/configs/c.1/ffs.mtp" ]; then
+        echo "mtp: already"
+        mode_set mtp
+        return 0
     fi
-    init_clean_gadget
+    gadget_skeleton || return 1
     echo 0x0200 > idProduct
 
-    cd /sys/kernel/config/usb_gadget/g1
     mkdir functions/ffs.mtp
-
-    ln -s functions/ffs.mtp configs/c.1
-    mkdir /dev/ffs-mtp
-    mount -t functionfs mtp /dev/ffs-mtp
+    ln -s functions/ffs.mtp configs/c.1/
+    mkdir -p /dev/ffs-mtp
+    mount -t functionfs mtp /dev/ffs-mtp || {
+        echo "FAIL: mount mtp ffs" >&2
+        return 1
+    }
 
     if [ -f /tmp/sd_mounted ]; then
         cp /etc/umtprd/umtprd_sd.conf /etc/umtprd/umtprd.conf
@@ -60,58 +184,135 @@ mtp_start() {
         cp /etc/umtprd/umtprd_nosd.conf /etc/umtprd/umtprd.conf
     fi
 
-    start-stop-daemon -S -q -m -b -p /var/run/umtprd.pid -x /usr/sbin/umtprd
+    daemon_start "$UMTPRD_PID" /usr/sbin/umtprd
     sleep 1
-    ls /sys/class/udc/ > /sys/kernel/config/usb_gadget/g1/UDC
-    [ $? = 0 ] && echo "OK" || echo "FAIL"
+    udc_ok_or_fail
+    _r=$?
+    [ "$_r" -eq 0 ] && mode_set mtp
+    return "$_r"
 }
 
 serial_start() {
-    if [ -d "/sys/kernel/config/usb_gadget/g1/configs/c.1/acm.usb0" ]; then
-        echo "Serial already running."
-        return
+    mode_already serial && return 0
+    if [ -d "$GADGET_ROOT/configs/c.1/acm.usb0" ]; then
+        echo "serial: already"
+        mode_set serial
+        return 0
     fi
-    init_clean_gadget
+    gadget_skeleton || return 1
     echo 0x0201 > idProduct
 
-    cd /sys/kernel/config/usb_gadget/g1
     mkdir functions/acm.usb0
-
     ln -s functions/acm.usb0 configs/c.1
-    start-stop-daemon -S -q -m -b -p /var/run/getty.pid -x /sbin/getty -- -L ttyGS0 115200 vt100
+    daemon_start "$GETTY_PID" /sbin/getty -L ttyGS0 115200 vt100
     sleep 1
-    ls /sys/class/udc/ > /sys/kernel/config/usb_gadget/g1/UDC
-    [ $? = 0 ] && echo "OK" || echo "FAIL"
+    udc_ok_or_fail
+    _r=$?
+    [ "$_r" -eq 0 ] && mode_set serial
+    return "$_r"
 }
 
 rndis_start() {
-    if [ -d "/sys/kernel/config/usb_gadget/g1/configs/c.1/rndis.usb0" ]; then
-        echo "RNDIS already running."
-        return
+    mode_already rndis && return 0
+    if [ -d "$GADGET_ROOT/configs/c.1/rndis.usb0" ]; then
+        echo "rndis: already"
+        mode_set rndis
+        return 0
     fi
-    init_clean_gadget
+    gadget_skeleton || return 1
     echo 0x0202 > idProduct
 
-    cd /sys/kernel/config/usb_gadget/g1
     mkdir functions/rndis.usb0
-
     ln -s functions/rndis.usb0 configs/c.1
     sleep 1
-    ls /sys/class/udc/ > /sys/kernel/config/usb_gadget/g1/UDC
+    bind_udc
+    _br=$?
+    case "$_br" in
+        1) echo FAIL; return 1 ;;
+    esac
     sleep 1
-    /sbin/ifup -a
-    [ $? = 0 ] && echo "OK" || echo "FAIL"
+    if /sbin/ifup -a; then
+        echo OK
+        mode_set rndis
+        return 0
+    fi
+    echo FAIL
+    return 1
 }
 
+epass_start() {
+    mode_already epass && return 0
+
+    ensure_configfs || return 1
+    gadget_full_stop
+
+    mkdir "$GADGET_ROOT" || {
+        echo "FAIL: mkdir gadget" >&2
+        return 1
+    }
+    cd "$GADGET_ROOT" || return 1
+
+    echo 0x0203 > idProduct
+    echo 0x1D6B > idVendor
+    echo 0x0100 > bcdUSB
+    echo 0x0200 > bcdDevice
+
+    mkdir -p strings/0x409
+
+    mkdir -p configs/c.1/strings/0x409
+    echo "Config 1" > configs/c.1/strings/0x409/configuration
+    echo 120 > configs/c.1/MaxPower
+
+    mkdir -p "functions/ffs.$FFS_INSTANCE"
+    if [ ! -e "configs/c.1/ffs.$FFS_INSTANCE" ]; then
+        ln -s "functions/ffs.$FFS_INSTANCE" "configs/c.1/" || return 1
+    fi
+
+    if [ -d os_desc ]; then
+        echo 1 > os_desc/use
+        echo "$MS_VENDOR_CODE" > os_desc/b_vendor_code
+        printf 'MSFT100\0' > os_desc/qw_sign
+        if [ ! -e os_desc/c.1 ]; then
+            ln -s configs/c.1 os_desc/ 2>/dev/null \
+                || echo "warn: os_desc link" >&2
+        fi
+    else
+        echo "warn: no os_desc" >&2
+    fi
+
+    mkdir -p "$FFS_MOUNT"
+    mount -t functionfs "$FFS_INSTANCE" "$FFS_MOUNT" || {
+        echo "FAIL: mount functionfs" >&2
+        return 1
+    }
+
+    RESPONDER_VERBOSE_ARG=
+    case "${USB_RESPONDER_VERBOSE:-}" in
+        1|true|yes) RESPONDER_VERBOSE_ARG="-v" ;;
+    esac
+
+    if have_ssd; then
+        start-stop-daemon -S -q -m -b -p "$RESPONDER_PIDFILE" -x "$USB_RESPONDER" -- \
+            $RESPONDER_VERBOSE_ARG \
+            --ffs "$FFS_MOUNT" \
+            "$@"
+    else
+        "$USB_RESPONDER" \
+            $RESPONDER_VERBOSE_ARG \
+            --ffs "$FFS_MOUNT" \
+            "$@" &
+        echo $! > "$RESPONDER_PIDFILE"
+    fi
+
+    sleep 1
+    udc_ok_or_fail
+    _r=$?
+    [ "$_r" -eq 0 ] && mode_set epass
+    return "$_r"
+}
 
 stop() {
-    printf "Stopping USB gadget: "
-    echo > /sys/kernel/config/usb_gadget/g1/UDC 2>/dev/null
-    start-stop-daemon -K -q -p /var/run/umtprd.pid -x /usr/sbin/umtprd 2>/dev/null
-    start-stop-daemon -K -q -p /var/run/getty.pid -x /sbin/getty 2>/dev/null
-    umount /dev/ffs-mtp 2>/dev/null
-    rm -rf /sys/kernel/config/usb_gadget/g1 2>/dev/null
-    [ $? = 0 ] && echo "OK" || echo "FAIL"
+    gadget_full_stop && echo "OK" || echo "FAIL"
 }
 
 case "$1" in
@@ -124,6 +325,10 @@ case "$1" in
     rndis)
         rndis_start
         ;;
+    epass|responder)
+        shift
+        epass_start "$@"
+        ;;
     none)
         stop
         ;;
@@ -134,8 +339,11 @@ case "$1" in
         stop
         ;;
     *)
-        echo "Usage: $0 {mtp|serial|rndis|none|start|stop}"
+        echo "Usage: $0 {mtp|serial|rndis|epass|none|start|stop} [epass extra args...]" >&2
         exit 1
+        ;;
 esac
 
 exit $?
+
+

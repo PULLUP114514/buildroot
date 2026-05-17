@@ -1,0 +1,6 @@
+config BR2_PACKAGE_EPASS_USB_RESPONDER
+	bool "epass_usb_responder"
+	help
+	  Electronic Pass USB Responder.
+
+	  https://github.com/rhodesepass/epass_usb_responder

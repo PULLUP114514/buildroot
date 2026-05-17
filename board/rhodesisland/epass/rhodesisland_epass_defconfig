@@ -21,6 +21,8 @@ BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/rhodesisland/epass/linux.defconfig"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
 BR2_LINUX_KERNEL_CUSTOM_DTS_PATH="board/allwinner/suniv-f1c100s/devicetree/linux/suniv-f1c100s.dtsi board/rhodesisland/epass/devicetree/linux/base/epass.dtsi board/rhodesisland/epass/devicetree/linux/base/devicetree-0.3.dts"
 BR2_PACKAGE_EPASS_DRM_APP=y
+BR2_PACKAGE_EPASS_USB_RESPONDER=y
+BR2_PACKAGE_EPASSCTL=y
 BR2_PACKAGE_GDB=y
 BR2_PACKAGE_MTD=y
 # BR2_PACKAGE_MTD_FLASHCP is not set
@@ -81,6 +83,7 @@ BR2_TARGET_UBOOT_CUSTOM_DTS_PATH="board/allwinner/suniv-f1c100s/devicetree/uboot
 BR2_PACKAGE_HOST_DOSFSTOOLS=y
 BR2_PACKAGE_HOST_E2FSPROGS=y
 BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_MTD=y
 BR2_PACKAGE_HOST_MTOOLS=y
 BR2_PACKAGE_HOST_PYTHON3=y
 BR2_PACKAGE_HOST_PYTHON3_SSL=y
