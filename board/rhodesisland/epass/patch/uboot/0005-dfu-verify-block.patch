@@ -1,0 +1,185 @@
+diff --git a/drivers/dfu/dfu_mtd.c b/drivers/dfu/dfu_mtd.c
+index 36cd4e94..e88ae454 100644
+--- a/drivers/dfu/dfu_mtd.c
++++ b/drivers/dfu/dfu_mtd.c
+@@ -9,6 +9,7 @@
+ 
+ #include <common.h>
+ #include <dfu.h>
++#include <malloc.h>
+ #include <mtd.h>
+ #include <jffs2/load_kernel.h>
+ #include <linux/err.h>
+@@ -18,12 +19,72 @@ static bool mtd_is_aligned_with_block_size(struct mtd_info *mtd, u64 size)
+ 	return !do_div(size, mtd->erasesize);
+ }
+ 
++static u32 mtd_len_in_current_block(struct mtd_info *mtd, u64 off)
++{
++	u64 tmp = off;
++	u32 rem = do_div(tmp, mtd->erasesize);
++
++	return rem ? mtd->erasesize - rem : mtd->erasesize;
++}
++
++static int mtd_write_skip_bad_block(struct dfu_entity *dfu, struct mtd_info *mtd,
++				    u64 *off, u64 lim)
++{
++	struct erase_info erase_op = {};
++	u64 bad_off = round_down(*off, mtd->erasesize);
++	int ret;
++
++	ret = mtd_block_markbad(mtd, bad_off);
++	if (ret) {
++		printf("Failed to mark bad block at 0x%08llx\n", bad_off);
++		return ret;
++	}
++
++	printf("Marked block bad at 0x%08llx, retrying at next block\n", bad_off);
++
++	*off = bad_off + mtd->erasesize;
++	dfu->bad_skip += mtd->erasesize;
++
++	erase_op.mtd = mtd;
++	erase_op.len = mtd->erasesize;
++	erase_op.scrub = 0;
++	while (*off < lim) {
++		if (mtd_block_isbad(mtd, *off)) {
++			printf("Skipping bad block at 0x%08llx\n", *off);
++			*off += mtd->erasesize;
++			dfu->bad_skip += mtd->erasesize;
++			continue;
++		}
++
++		erase_op.addr = *off;
++		ret = mtd_erase(mtd, &erase_op);
++		if (!ret)
++			return 0;
++
++		if (ret != -EIO) {
++			printf("Failure while erasing replacement block at 0x%llx\n",
++			       *off);
++			return ret;
++		}
++
++		printf("Skipping bad block at 0x%08llx\n", *off);
++		*off += mtd->erasesize;
++		dfu->bad_skip += mtd->erasesize;
++	}
++
++	printf("No space left after bad block at 0x%08llx\n", bad_off);
++	return -ENOSPC;
++}
++
+ static int mtd_block_op(enum dfu_op op, struct dfu_entity *dfu,
+ 			u64 offset, void *buf, long *len)
+ {
+ 	u64 off, lim, remaining;
++	u32 chunk_len;
+ 	struct mtd_info *mtd = dfu->data.mtd.info;
+ 	struct mtd_oob_ops io_op = {};
++	struct mtd_oob_ops verify_op = {};
++	u8 *verify_buf = NULL;
+ 	int ret = 0;
+ 	bool has_pages = mtd->type == MTD_NANDFLASH ||
+ 			 mtd->type == MTD_MLCNANDFLASH;
+@@ -89,10 +150,21 @@ static int mtd_block_op(enum dfu_op op, struct dfu_entity *dfu,
+ 		}
+ 	}
+ 
++	if (op == DFU_OP_WRITE && has_pages) {
++		verify_buf = malloc(mtd->erasesize);
++		if (!verify_buf)
++			return -ENOMEM;
++	}
++
+ 	io_op.mode = MTD_OPS_AUTO_OOB;
+ 	io_op.len = *len;
+-	if (has_pages && io_op.len > mtd->writesize)
++	if (has_pages && op == DFU_OP_READ && io_op.len > mtd->writesize)
+ 		io_op.len = mtd->writesize;
++	else if (has_pages && op == DFU_OP_WRITE) {
++		chunk_len = mtd_len_in_current_block(mtd, off);
++		if (io_op.len > chunk_len)
++			io_op.len = chunk_len;
++	}
+ 	io_op.ooblen = 0;
+ 	io_op.datbuf = buf;
+ 	io_op.oobbuf = NULL;
+@@ -106,10 +178,11 @@ static int mtd_block_op(enum dfu_op op, struct dfu_entity *dfu,
+ 			       off);
+ 			if (op == DFU_OP_READ) {
+ 				*len -= remaining;
+-				return 0;
++				ret = 0;
+ 			} else {
+-				return -EIO;
++				ret = -EIO;
+ 			}
++			goto out;
+ 		}
+ 
+ 		/* Skip the block if it is bad */
+@@ -128,17 +201,60 @@ static int mtd_block_op(enum dfu_op op, struct dfu_entity *dfu,
+ 		if (ret) {
+ 			printf("Failure while %s at offset 0x%llx\n",
+ 			       op == DFU_OP_READ ? "reading" : "writing", off);
+-			return -EIO;
++			if (op == DFU_OP_WRITE && has_pages) {
++				ret = mtd_write_skip_bad_block(dfu, mtd, &off, lim);
++				if (ret)
++					goto out;
++
++				chunk_len = mtd_len_in_current_block(mtd, off);
++				io_op.len = remaining;
++				if (io_op.len > chunk_len)
++					io_op.len = chunk_len;
++				continue;
++			}
++			ret = -EIO;
++			goto out;
++		}
++
++		if (op == DFU_OP_WRITE && has_pages) {
++			verify_op.mode = io_op.mode;
++			verify_op.len = io_op.retlen;
++			verify_op.ooblen = 0;
++			verify_op.datbuf = verify_buf;
++			verify_op.oobbuf = NULL;
++
++			ret = mtd_read_oob(mtd, off, &verify_op);
++			if (ret || verify_op.retlen != io_op.retlen ||
++			    memcmp(verify_buf, io_op.datbuf, io_op.retlen)) {
++				printf("Write verify failed at offset 0x%llx\n",
++				       off);
++				ret = mtd_write_skip_bad_block(dfu, mtd, &off, lim);
++				if (ret)
++					goto out;
++
++				chunk_len = mtd_len_in_current_block(mtd, off);
++				io_op.len = remaining;
++				if (io_op.len > chunk_len)
++					io_op.len = chunk_len;
++				continue;
++			}
+ 		}
+ 
+ 		off += io_op.retlen;
+ 		remaining -= io_op.retlen;
+ 		io_op.datbuf += io_op.retlen;
+ 		io_op.len = remaining;
+-		if (has_pages && io_op.len > mtd->writesize)
++		if (has_pages && op == DFU_OP_READ && io_op.len > mtd->writesize)
+ 			io_op.len = mtd->writesize;
++		else if (has_pages && op == DFU_OP_WRITE) {
++			chunk_len = mtd_len_in_current_block(mtd, off);
++			if (io_op.len > chunk_len)
++				io_op.len = chunk_len;
++		}
+ 	}
+ 
++out:
++	free(verify_buf);
+ 	return ret;
+ }
+ 
