@@ -18,7 +18,7 @@
 		ranges;
 
 		// this bootargs will not work. change bootargs in uboot!
-		bootargs = "serial0:115200n8 console=ttyS0,115200 console=tty0 earlyprintk rootwait init=/preinit root=/dev/mtdblock2 rootfstype=squashfs overlayfsdev=/dev/mtdblock3 fbcon=rotate:2 debug drm.debug=0x1ff";
+		bootargs = "i luv mostima";
 
 	};
 
@@ -150,12 +150,12 @@
 
 			partition@1 {
 				label = "boot";
-				reg = <0x100000 0xC00000>;
+				reg = <0x100000 0x600000>;
 			};
 
 			partition@2 {
 				label = "rootfs";
-				reg = <0xD00000 0x7300000>;
+				reg = <0x700000 0x7900000>;
 			};
 		};
 	};
