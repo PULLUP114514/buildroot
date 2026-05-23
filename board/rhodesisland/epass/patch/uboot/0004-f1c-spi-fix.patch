@@ -1,0 +1,147 @@
+diff --git a/drivers/spi/spi-sunxi.c b/drivers/spi/spi-sunxi.c
+index d7de4539..f0157017 100644
+--- a/drivers/spi/spi-sunxi.c
++++ b/drivers/spi/spi-sunxi.c
+@@ -35,6 +35,7 @@
+ #include <asm/io.h>
+ 
+ #include <linux/iopoll.h>
++#include <linux/log2.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -72,9 +73,14 @@ DECLARE_GLOBAL_DATA_PTR;
+ #define SUN4I_XMIT_CNT(cnt)		((cnt) & SUN4I_MAX_XFER_SIZE)
+ #define SUN4I_FIFO_STA_RF_CNT_BITS	0
+ 
+-#define SUN4I_SPI_MAX_RATE		24000000
++/*
++ * The maximum SPI bus rate and the parent ("module") clock rate are
++ * SoC specific and tracked per-variant (see struct sun4i_spi_variant).
++ * The legacy SUN4I_SPI_MAX_RATE macro used to be both, which is wrong
++ * on SoCs (e.g. suniv/F1C100s) that feed the SPI controller directly
++ * from the AHB clock instead of OSC24M.
++ */
+ #define SUN4I_SPI_MIN_RATE		3000
+-#define SUN4I_SPI_DEFAULT_RATE		1000000
+ #define SUN4I_SPI_TIMEOUT_US		1000000
+ 
+ #define SPI_REG(priv, reg)		((priv)->base + \
+@@ -121,6 +127,10 @@ struct sun4i_spi_variant {
+ 	bool has_soft_reset;
+ 	bool has_burst_ctl;
+ 	bool always_on;
++	/* Rate (Hz) of the clock feeding the SPI controller's CDR divider. */
++	u32 mod_clk_hz;
++	/* Maximum SPI bus rate (Hz) supported by the controller. */
++	u32 max_speed_hz;
+ };
+ 
+ struct sun4i_spi_platdata {
+@@ -412,7 +422,8 @@ static int sun4i_spi_set_speed(struct udevice *dev, uint speed)
+ {
+ 	struct sun4i_spi_platdata *plat = dev_get_platdata(dev);
+ 	struct sun4i_spi_priv *priv = dev_get_priv(dev);
+-	unsigned int div;
++	u32 parent = priv->variant->mod_clk_hz;
++	unsigned int div, div_cdr1, div_cdr2;
+ 	u32 reg;
+ 
+ 	if (speed > plat->max_hz)
+@@ -433,19 +444,24 @@ static int sun4i_spi_set_speed(struct udevice *dev, uint speed)
+ 	 *
+ 	 * First try CDR2, and if we can't reach the expected
+ 	 * frequency, fall back to CDR1.
++	 *
++	 * Use DIV_ROUND_UP (and order_base_2 for CDR1) so the actual
++	 * SCLK never exceeds the requested speed, matching what Linux's
++	 * spi-sun6i.c does.  The parent rate is taken from the variant
++	 * because U-Boot's sunxi clk driver only models gates and cannot
++	 * report a real rate via clk_get_rate().
+ 	 */
+ 
+-	div = SUN4I_SPI_MAX_RATE / (2 * speed);
++	div_cdr1 = DIV_ROUND_UP(parent, speed);
++	div_cdr2 = DIV_ROUND_UP(div_cdr1, 2);
+ 	reg = readl(SPI_REG(priv, SPI_CCR));
+ 
+-	if (div <= (SUN4I_CLK_CTL_CDR2_MASK + 1)) {
+-		if (div > 0)
+-			div--;
+-
++	if (div_cdr2 <= (SUN4I_CLK_CTL_CDR2_MASK + 1)) {
+ 		reg &= ~(SUN4I_CLK_CTL_CDR2_MASK | SUN4I_CLK_CTL_DRS);
+-		reg |= SUN4I_CLK_CTL_CDR2(div) | SUN4I_CLK_CTL_DRS;
++		reg |= SUN4I_CLK_CTL_CDR2(div_cdr2 - 1) | SUN4I_CLK_CTL_DRS;
+ 	} else {
+-		div = __ilog2(SUN4I_SPI_MAX_RATE) - __ilog2(speed);
++		div = min_t(u32, SUN4I_CLK_CTL_CDR1_MASK,
++			    order_base_2(div_cdr1));
+ 		reg &= ~((SUN4I_CLK_CTL_CDR1_MASK << 8) | SUN4I_CLK_CTL_DRS);
+ 		reg |= SUN4I_CLK_CTL_CDR1(div);
+ 	}
+@@ -527,12 +543,18 @@ static int sun4i_spi_ofdata_to_platdata(struct udevice *bus)
+ 
+ 	plat->base = devfdt_get_addr(bus);
+ 	plat->variant = (struct sun4i_spi_variant *)dev_get_driver_data(bus);
++	/*
++	 * If the device tree doesn't cap the bus rate, fall back to the
++	 * variant maximum (typically 100 MHz) instead of an arbitrary
++	 * 1 MHz default, which used to throttle the bus far below what
++	 * the slave's spi-max-frequency would allow.
++	 */
+ 	plat->max_hz = fdtdec_get_int(gd->fdt_blob, node,
+ 				      "spi-max-frequency",
+-				      SUN4I_SPI_DEFAULT_RATE);
++				      plat->variant->max_speed_hz);
+ 
+-	if (plat->max_hz > SUN4I_SPI_MAX_RATE)
+-		plat->max_hz = SUN4I_SPI_MAX_RATE;
++	if (plat->max_hz > plat->variant->max_speed_hz)
++		plat->max_hz = plat->variant->max_speed_hz;
+ 
+ 	return 0;
+ }
+@@ -597,6 +619,9 @@ static const struct sun4i_spi_variant sun4i_a10_spi_variant = {
+ 	.regs			= sun4i_spi_regs,
+ 	.bits			= sun4i_spi_bits,
+ 	.fifo_depth		= 64,
++	/* SPL configures the SPI module clock to OSC24M. */
++	.mod_clk_hz		= 24000000,
++	.max_speed_hz		= 100000000,
+ };
+ 
+ static const struct sun4i_spi_variant sun6i_a31_spi_variant = {
+@@ -605,6 +630,8 @@ static const struct sun4i_spi_variant sun6i_a31_spi_variant = {
+ 	.fifo_depth		= 128,
+ 	.has_soft_reset		= true,
+ 	.has_burst_ctl		= true,
++	.mod_clk_hz		= 24000000,
++	.max_speed_hz		= 100000000,
+ };
+ 
+ static const struct sun4i_spi_variant sun8i_h3_spi_variant = {
+@@ -613,6 +640,8 @@ static const struct sun4i_spi_variant sun8i_h3_spi_variant = {
+ 	.fifo_depth		= 64,
+ 	.has_soft_reset		= true,
+ 	.has_burst_ctl		= true,
++	.mod_clk_hz		= 24000000,
++	.max_speed_hz		= 100000000,
+ };
+ 
+ static const struct sun4i_spi_variant suniv_spi_variant = {
+@@ -622,6 +651,14 @@ static const struct sun4i_spi_variant suniv_spi_variant = {
+ 	.has_soft_reset = true,
+ 	.has_burst_ctl = true,
+ 	.always_on = true,
++	/*
++	 * suniv (F1C100s/F1C200s) has no dedicated SPI module clock; the
++	 * SPI controller's CDR divider is fed directly by AHB_CLK, which
++	 * U-Boot's SPL programs to PLL_PERIPH/3 = 200 MHz.  Hardware limit
++	 * is SPI_SCLK <= AHB_CLK/2 = 100 MHz (see F1C100s manual 7.3.5).
++	 */
++	.mod_clk_hz = 200000000,
++	.max_speed_hz = 100000000,
+ };
+ 
+ static const struct udevice_id sun4i_spi_ids[] = {
