@@ -2,7 +2,7 @@ diff --git a/drivers/gpu/drm/panel/panel-simple.c b/drivers/gpu/drm/panel/panel-
 index 4eb0e14b1..606e0239f 100644
 --- a/drivers/gpu/drm/panel/panel-simple.c
 +++ b/drivers/gpu/drm/panel/panel-simple.c
-@@ -1396,12 +1396,51 @@ static const struct panel_desc foxlink_fl500wvr00_a0t = {
+@@ -1396,12 +1396,75 @@ static const struct panel_desc foxlink_fl500wvr00_a0t = {
  	.num_modes = 1,
  	.bpc = 8,
  	.size = {
@@ -52,16 +52,43 @@ index 4eb0e14b1..606e0239f 100644
 +	// .bus_flags = DRM_BUS_FLAG_PIXDATA_NEGEDGE,
 +};
 +
++static const struct drm_display_mode lattland_hsd_nv3052_mode = {
++	.clock = 42418,			// 812*1306*40/1000, 40Hz
++	.hdisplay = 720,
++	.hsync_start = 720 + 46,	// +HFPD
++	.hsync_end = 720 + 46 + 10,	// +HSPW
++	.htotal = 720 + 46 + 10 + 36,	// +HBPD = 812
++	.vdisplay = 1280,
++	.vsync_start = 1280 + 16,	// +VFPD
++	.vsync_end = 1280 + 16 + 5,	// +VSPW
++	.vtotal = 1280 + 16 + 5 + 5,	// +VBPD = 1306
++	.vrefresh = 40,
++};
++
++static const struct panel_desc lattland_hsd_nv3052 = {
++	.modes = &lattland_hsd_nv3052_mode,
++	.num_modes = 1,
++	.bpc = 6,
++	.size = {
++		.width = 68,
++		.height = 121,
++	},
++	.bus_format = MEDIA_BUS_FMT_RGB565_1X16,
++};
++
  static const struct drm_display_mode friendlyarm_hd702e_mode = {
  	.clock		= 67185,
  	.hdisplay	= 800,
-@@ -3271,6 +3310,9 @@ static const struct of_device_id platform_of_match[] = {
+@@ -3271,6 +3334,12 @@ static const struct of_device_id platform_of_match[] = {
  	}, {
  		.compatible = "foxlink,fl500wvr00-a0t",
  		.data = &foxlink_fl500wvr00_a0t,
 +	}, {
 +		.compatible = "lattland,mostima",
 +		.data = &lattland_mostima,
++	}, {
++		.compatible = "lattland,hsd-nv3052",
++		.data = &lattland_hsd_nv3052,
  	}, {
  		.compatible = "friendlyarm,hd702e",
  		.data = &friendlyarm_hd702e,
