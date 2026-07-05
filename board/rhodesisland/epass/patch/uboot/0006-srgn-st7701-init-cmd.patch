@@ -1,0 +1,269 @@
+diff -Naur a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+--- a/arch/arm/mach-sunxi/Kconfig	2026-07-05 15:52:43.225288591 +0800
++++ b/arch/arm/mach-sunxi/Kconfig	2026-07-05 15:52:43.238975868 +0800
+@@ -914,6 +914,14 @@
+ config VIDEO_LCD_IF_LVDS
+ 	bool
+ 
++config SRGN_ST7701_INIT
++	bool "srgn_st7701init command to bitbang LCD panel init from kernel DTB"
++	depends on MACH_SUNIV
++	help
++	  Adds the srgn_st7701init command. It parses the merged kernel DTB
++	  for an enabled lattland,st7701-initseq node and bitbangs the
++	  ST7701/NV3052 init sequence over GPIO before booting Linux.
++
+ config SUNXI_DE2
+ 	bool
+ 	default n
+diff -Naur a/board/sunxi/Makefile b/board/sunxi/Makefile
+--- a/board/sunxi/Makefile	2026-07-05 15:52:43.224152117 +0800
++++ b/board/sunxi/Makefile	2026-07-05 16:02:31.913325759 +0800
+@@ -11,3 +11,6 @@
+ obj-$(CONFIG_MACH_SUN4I)	+= dram_sun4i_auto.o
+ obj-$(CONFIG_MACH_SUN5I)	+= dram_sun5i_auto.o
+ obj-$(CONFIG_MACH_SUN7I)	+= dram_sun5i_auto.o
++ifndef CONFIG_SPL_BUILD
++obj-$(CONFIG_SRGN_ST7701_INIT)	+= srgn_st7701.o
++endif
+diff -Naur a/board/sunxi/srgn_st7701.c b/board/sunxi/srgn_st7701.c
+--- a/board/sunxi/srgn_st7701.c	1970-01-01 08:00:00.000000000 +0800
++++ b/board/sunxi/srgn_st7701.c	2026-07-05 20:27:19.907868886 +0800
+@@ -0,0 +1,237 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * srgn_st7701init - bitbang the ST7701/NV3052 panel init sequence found
++ * in the merged kernel DTB (lattland,st7701-initseq node), so the panel
++ * is alive before Linux and a boot splash can be shown.
++ *
++ * Bit-level protocol mirrors the kernel driver
++ * drivers/staging/shirogane/st7701init.c (9-bit 3-wire SPI, D/C bit
++ * first, then 8 data bits MSB-first).
++ *
++ * Rhodes Island Engineering Dept, 1097
++ */
++
++#include <common.h>
++#include <command.h>
++#include <env.h>
++#include <fdtdec.h>
++#include <linux/delay.h>
++#include <linux/libfdt.h>
++#include <asm/io.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/gpio.h>
++
++/* same opcodes as include/dt-bindings/display/st7701initseq.h in the kernel */
++#define ST7701INIT_BEGIN_WRITE		0
++#define ST7701INIT_WRITE_COMMAND_8	1
++#define ST7701INIT_WRITE_C8_D8		2
++#define ST7701INIT_WRITE_C8_D16		3
++#define ST7701INIT_WRITE_BYTES		4
++#define ST7701INIT_END_WRITE		5
++#define ST7701INIT_DELAY		6
++
++struct srgn_gpio {
++	struct sunxi_gpio *pio;
++	u32 num;
++	bool active_low;
++	bool valid;
++};
++
++struct srgn_panel {
++	struct srgn_gpio sda, scl, cs, rst;
++};
++
++static void srgn_gpio_set(struct srgn_gpio *g, int val)
++{
++	u32 dat;
++
++	if (!g->valid)
++		return;
++	if (g->active_low)
++		val = !val;
++	dat = readl(&g->pio->dat);
++	if (val)
++		dat |= 1U << g->num;
++	else
++		dat &= ~(1U << g->num);
++	writel(dat, &g->pio->dat);
++}
++
++/* gpios props are 4 cells: <&pio bank pin flags>, flags bit0 = active low */
++static int srgn_gpio_get(const void *blob, int node, const char *prop,
++			 struct srgn_gpio *g, int initval)
++{
++	const fdt32_t *cells;
++	int len;
++	u32 bank;
++
++	g->valid = false;
++	cells = fdt_getprop(blob, node, prop, &len);
++	if (!cells || len < 4 * (int)sizeof(fdt32_t))
++		return -1;
++
++	bank = fdt32_to_cpu(cells[1]);
++	g->pio = BANK_TO_GPIO(bank);
++	g->num = fdt32_to_cpu(cells[2]);
++	g->active_low = fdt32_to_cpu(cells[3]) & 1;
++	g->valid = true;
++
++	/* set level before switching the pad to output to avoid glitches */
++	srgn_gpio_set(g, initval);
++	sunxi_gpio_set_cfgpin(bank * 32 + g->num, SUNXI_GPIO_OUTPUT);
++	return 0;
++}
++
++/*
++ * Raw register bitbang would clock SCL at a few MHz; the kernel gpiolib
++ * path the panels are proven with runs ~100x slower. Pace every SCL
++ * half-period to ~500 kHz to stay well inside what the flex wiring
++ * handles. Whole sequence still finishes in a few ms.
++ */
++#define SRGN_BB_HALF_PERIOD_US	1
++
++static void srgn_write_9bit(struct srgn_panel *p, int dc, u8 value)
++{
++	int i;
++
++	srgn_gpio_set(&p->scl, 0);
++	srgn_gpio_set(&p->sda, dc);
++	udelay(SRGN_BB_HALF_PERIOD_US);
++	srgn_gpio_set(&p->scl, 1);
++	udelay(SRGN_BB_HALF_PERIOD_US);
++
++	for (i = 0; i < 8; i++) {
++		srgn_gpio_set(&p->scl, 0);
++		srgn_gpio_set(&p->sda, !!(value & 0x80));
++		udelay(SRGN_BB_HALF_PERIOD_US);
++		srgn_gpio_set(&p->scl, 1);
++		udelay(SRGN_BB_HALF_PERIOD_US);
++	}
++	srgn_gpio_set(&p->scl, 0);
++	udelay(SRGN_BB_HALF_PERIOD_US);
++}
++
++#define srgn_write_comm(p, v) srgn_write_9bit(p, 0, v)
++#define srgn_write_data(p, v) srgn_write_9bit(p, 1, v)
++
++static int srgn_run_seq(struct srgn_panel *p, const fdt32_t *seq, int count)
++{
++	int i = 0, j, len, op;
++
++	srgn_gpio_set(&p->cs, 1);
++	srgn_gpio_set(&p->scl, 0);
++	srgn_gpio_set(&p->sda, 0);
++	udelay(10);
++
++	if (p->rst.valid) {
++		srgn_gpio_set(&p->rst, 0);
++		mdelay(120);
++		srgn_gpio_set(&p->rst, 1);
++		mdelay(120);
++	}
++
++#define NEXT() fdt32_to_cpu(seq[i++])
++	while (i < count) {
++		op = NEXT();
++		switch (op) {
++		case ST7701INIT_BEGIN_WRITE:
++			srgn_gpio_set(&p->cs, 0);
++			udelay(SRGN_BB_HALF_PERIOD_US);
++			break;
++		case ST7701INIT_WRITE_COMMAND_8:
++			srgn_write_comm(p, NEXT());
++			break;
++		case ST7701INIT_WRITE_C8_D8:
++			srgn_write_comm(p, NEXT());
++			srgn_write_data(p, NEXT());
++			break;
++		case ST7701INIT_WRITE_C8_D16:
++			srgn_write_comm(p, NEXT());
++			srgn_write_data(p, NEXT());
++			srgn_write_data(p, NEXT());
++			break;
++		case ST7701INIT_WRITE_BYTES:
++			len = NEXT();
++			for (j = 0; j < len && i < count; j++)
++				srgn_write_data(p, NEXT());
++			break;
++		case ST7701INIT_END_WRITE:
++			srgn_gpio_set(&p->cs, 1);
++			udelay(SRGN_BB_HALF_PERIOD_US);
++			break;
++		case ST7701INIT_DELAY:
++			mdelay(NEXT());
++			break;
++		default:
++			printf("srgn: unknown st7701 op %d at %d\n", op, i - 1);
++			return -1;
++		}
++	}
++#undef NEXT
++	return 0;
++}
++
++static int do_srgn_st7701init(struct cmd_tbl *cmdtp, int flag, int argc,
++			      char *const argv[])
++{
++	struct srgn_panel p;
++	const fdt32_t *seq;
++	unsigned long addr;
++	void *blob;
++	int node, len;
++
++	if (argc > 1)
++		addr = simple_strtoul(argv[1], NULL, 16);
++	else
++		addr = env_get_hex("dtbaddr", 0);
++
++	blob = (void *)addr;
++	if (!addr || fdt_check_header(blob)) {
++		printf("srgn: no valid fdt at 0x%lx\n", addr);
++		return CMD_RET_FAILURE;
++	}
++
++	node = fdt_node_offset_by_compatible(blob, -1,
++					     "lattland,st7701-initseq");
++	if (node < 0) {
++		printf("srgn: no st7701-initseq node, skipping\n");
++		return 0;
++	}
++	if (!fdtdec_get_is_enabled(blob, node)) {
++		printf("srgn: st7701-initseq disabled, skipping\n");
++		return 0;
++	}
++
++	seq = fdt_getprop(blob, node, "init-sequence", &len);
++	if (!seq || len < (int)sizeof(fdt32_t)) {
++		printf("srgn: no init-sequence, skipping\n");
++		return 0;
++	}
++
++	if (srgn_gpio_get(blob, node, "sda-gpios", &p.sda, 0) ||
++	    srgn_gpio_get(blob, node, "scl-gpios", &p.scl, 0) ||
++	    srgn_gpio_get(blob, node, "cs-gpios", &p.cs, 1)) {
++		printf("srgn: missing sda/scl/cs gpios\n");
++		return CMD_RET_FAILURE;
++	}
++	srgn_gpio_get(blob, node, "rst-gpios", &p.rst, 1);
++
++	printf("srgn: st7701 init, %d cells\n", len / (int)sizeof(fdt32_t));
++	if (srgn_run_seq(&p, seq, len / sizeof(fdt32_t))) {
++		printf("srgn: init failed, leaving node enabled for kernel\n");
++		return CMD_RET_FAILURE;
++	}
++
++	/* done in u-boot: keep the kernel driver from re-running it */
++	if (fdt_setprop_string(blob, node, "status", "disabled"))
++		printf("srgn: warning: could not disable node in fdt\n");
++
++	printf("srgn: st7701 init done\n");
++	return 0;
++}
++
++U_BOOT_CMD(
++	srgn_st7701init, 2, 0, do_srgn_st7701init,
++	"bitbang ST7701/NV3052 panel init from kernel DTB",
++	"[fdt_addr] - default ${dtbaddr}"
++);

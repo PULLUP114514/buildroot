@@ -1,4 +1,0 @@
-#!/bin/sh
-ubiattach -m 1
-mkdir -p /boot
-mount -t ubifs ubi1:boot /boot

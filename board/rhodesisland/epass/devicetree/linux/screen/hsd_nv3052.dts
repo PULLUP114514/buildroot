@@ -7,6 +7,8 @@
         target = <&st7701initseq>;
         __overlay__ {
             status = "okay";
+            /* pclk_khz hact hfp hslen hbp vact vfp vslen vbp (panel-simple lattland_hsd_nv3052_mode) */
+            srgn,panel-timing = <42418 720 46 10 36 1280 16 5 5>;
             init-sequence = <
                 ST7701INIT_BEGIN_WRITE
 

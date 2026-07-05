@@ -5,7 +5,7 @@
 ################################################################################
 
 
-EPASS_DRM_APP_VERSION = 836fe0e3fe0421eae8a34fab4dafeeb861afc7b1
+EPASS_DRM_APP_VERSION = f45e4fdc3f939dcd2e24fee8b6e775414b740f21
 EPASS_DRM_APP_SITE = https://github.com/rhodesepass/drm_app_neo.git
 EPASS_DRM_APP_SITE_METHOD = git
 EPASS_DRM_APP_DEPENDENCIES = freetype libdrm libpng libevdev

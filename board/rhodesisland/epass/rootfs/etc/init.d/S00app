@@ -18,14 +18,16 @@ log() {
     echo "epass_app: $*" > /dev/kmsg
 }
 
+# 不能读 /sys/class/drm/card0-*/modes:FBDEV_EMULATION 关了,app 自己
+# 打开 DRM 之前没人 probe connector,modes 恒为空
 panel_mode() {
-    cat /sys/class/drm/card0-*/modes 2>/dev/null | head -n 1
+    tr '\0' '\n' < /proc/device-tree/panel/compatible 2>/dev/null | head -n 1
 }
 
 pick_app() {
     case "$(panel_mode)" in
-        720x*) echo "$APP_DIR/app_720" ;;
-        *)     echo "$APP_DIR/app_360" ;;
+        lattland,hsd-nv3052) echo "$APP_DIR/app_720" ;;
+        *)                   echo "$APP_DIR/app_360" ;;
     esac
 }
 
@@ -40,6 +42,13 @@ remount_sd() {
     fi
 }
 
+start_usb_aio() {
+    # USB gadget 总管：greeter 枚举 -> 屏上选功能 -> 重枚举
+    if command -v usb_aio_handler > /dev/null; then
+        start-stop-daemon -S -q -m -b -p /var/run/usb_aio.pid -x "$(command -v usb_aio_handler)"
+    fi
+}
+
 supervise() {
     cd "$APP_DIR" || exit 1
 
@@ -48,16 +57,22 @@ supervise() {
 
     if [ ! -f "$APP" ]; then
         log "$APP missing, switching to MTP"
-        usbctl mtp
+        usbaioctl select mtp || usbctl mtp
         exit 1
     fi
 
     remount_sd
+
+    # 收掉 u-boot splash:灭 DEBE layer 并把保留的显存还给 buddy
+    [ -w /sys/kernel/srgn_splash/release ] && echo 1 > /sys/kernel/srgn_splash/release
+
     while true; do
         chmod +x "$APP" 2> /dev/null
         if [ -f /tmp/sd_mounted ]; then
+            log "starting $APP sd"
             "$APP" sd > /dev/null 2>&1
         else
+            log "starting $APP"
             "$APP" > /dev/null 2>&1
         fi
         ret=$?
@@ -97,6 +112,7 @@ supervise() {
 
 case "$1" in
     start)
+        start_usb_aio
         supervise &
         echo $! > "$PIDFILE"
         ;;

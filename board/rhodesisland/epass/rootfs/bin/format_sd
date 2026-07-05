@@ -83,8 +83,13 @@ echo "请把资源文件放入/assets/目录下。" > /sd/README.txt
 
 if [ -d "/sys/kernel/config/usb_gadget/g1/configs/c.1/ffs.mtp" ]; then
     echo "Restarting MTP service..."
-    usbctl stop
-    usbctl mtp
+    if command -v usbaioctl >/dev/null 2>&1; then
+        # SD 重新挂载后重启 MTP 会话（umtprd conf 会按 sd/nosd 重选）
+        usbaioctl select mtp
+    else
+        usbctl stop
+        usbctl mtp
+    fi
 fi
 
 echo "All done!"

@@ -2,6 +2,7 @@
 cp board/rhodesisland/epass/scripts/ubinize-rootfs.cfg "${BINARIES_DIR}/ubinize-rootfs.cfg"
 cp board/rhodesisland/epass/scripts/gensdimage.py "${BINARIES_DIR}/gensdimage.py"
 cp board/rhodesisland/epass/scripts/kernel.its "${BINARIES_DIR}"
+cp board/rhodesisland/epass/logo/*.rgb565.gz "${BINARIES_DIR}"
 
 MKIMAGE="${HOST_DIR}/bin/mkimage"
 IMAGE_ITS="kernel.its"

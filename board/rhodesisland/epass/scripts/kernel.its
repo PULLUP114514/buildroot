@@ -151,6 +151,37 @@
         };
 
 
+        /* boot splash logos (pre-gzipped RGB565 raw, gunzipped by imxtract) */
+        logo-hsd {
+            description = "splash logo 384x640 RGB565";
+            data = /incbin/("./logo-mostima.rgb565.gz");
+            type = "firmware";
+            arch = "arm";
+            compression = "gzip";
+        };
+        logo-boe {
+            description = "splash logo 384x640 RGB565";
+            data = /incbin/("./logo-mostima.rgb565.gz");
+            type = "firmware";
+            arch = "arm";
+            compression = "gzip";
+        };
+        logo-laowu {
+            description = "splash logo 384x640 RGB565";
+            data = /incbin/("./logo-mostima.rgb565.gz");
+            type = "firmware";
+            arch = "arm";
+            compression = "gzip";
+        };
+        logo-hsd_nv3052 {
+            description = "splash logo 720x1280 RGB565";
+            data = /incbin/("./logo-hsd_nv3052.rgb565.gz");
+            type = "firmware";
+            arch = "arm";
+            compression = "gzip";
+        };
+
+
         /* exts */
         fdt-ext-cardkb {
             description = "M5Stack CardKB extension overlay";
