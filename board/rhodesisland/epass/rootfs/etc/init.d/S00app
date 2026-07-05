@@ -1,0 +1,117 @@
+#!/bin/sh
+#
+# epass app supervisor
+#
+# app exit code protocol:
+#   0 - clean exit, stop supervising
+#   1 - remount SD card, restart app
+#   2 - run staged /tmp/appstart (self update), restart app
+#   3 - power off
+#   4 - format SD card, restart app
+#   5 - mount boot partition + srgn_config, restart app
+#   * - crash (incl. 128+N killed by signal), auto restart
+
+APP_DIR=/root
+PIDFILE=/var/run/epass_app.pid
+
+log() {
+    echo "epass_app: $*" > /dev/kmsg
+}
+
+panel_mode() {
+    cat /sys/class/drm/card0-*/modes 2>/dev/null | head -n 1
+}
+
+pick_app() {
+    case "$(panel_mode)" in
+        720x*) echo "$APP_DIR/app_720" ;;
+        *)     echo "$APP_DIR/app_360" ;;
+    esac
+}
+
+remount_sd() {
+    umount /sd > /dev/null 2>&1
+    umount /dev/mmcblk0p1 > /dev/null 2>&1
+    mkdir -p /sd
+    if mount -o iocharset=utf8 /dev/mmcblk0p1 /sd > /dev/null 2>&1; then
+        touch /tmp/sd_mounted
+    else
+        rm -f /tmp/sd_mounted
+    fi
+}
+
+supervise() {
+    cd "$APP_DIR" || exit 1
+
+    APP=$(pick_app)
+    log "panel mode '$(panel_mode)', using $APP"
+
+    if [ ! -f "$APP" ]; then
+        log "$APP missing, switching to MTP"
+        usbctl mtp
+        exit 1
+    fi
+
+    remount_sd
+    while true; do
+        chmod +x "$APP" 2> /dev/null
+        if [ -f /tmp/sd_mounted ]; then
+            "$APP" sd > /dev/null 2>&1
+        else
+            "$APP" > /dev/null 2>&1
+        fi
+        ret=$?
+        case "$ret" in
+            0)
+                log "clean exit"
+                break
+                ;;
+            1)
+                remount_sd
+                ;;
+            2)
+                log "running /tmp/appstart"
+                chmod +x /tmp/appstart 2> /dev/null
+                /tmp/appstart
+                ;;
+            3)
+                log "poweroff requested"
+                poweroff
+                break
+                ;;
+            4)
+                format_sd
+                ;;
+            5)
+                mount_boot
+                command -v srgn_config > /dev/null && srgn_config
+                ;;
+            *)
+                log "app crashed (exit $ret), restarting"
+                sleep 2
+                ;;
+        esac
+    done
+    rm -f "$PIDFILE"
+}
+
+case "$1" in
+    start)
+        supervise &
+        echo $! > "$PIDFILE"
+        ;;
+    stop)
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2> /dev/null
+        rm -f "$PIDFILE"
+        killall app_360 app_720 2> /dev/null
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

@@ -28,8 +28,6 @@ null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
 # now run any rc scripts
 ::sysinit:/etc/init.d/rcS
 
-# auto login
-tty0::respawn:/sbin/getty -L tty0 0 vt100 -n -l /bin/autologin
 # Put a getty on the serial port
 console::respawn:/sbin/getty -L ttyS0 0 vt100 # GENERIC_SERIAL
 

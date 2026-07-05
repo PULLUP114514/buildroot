@@ -5,7 +5,7 @@
 ################################################################################
 
 
-EPASS_USB_RESPONDER_VERSION = e57e74b8bf0611091e9fb6841ffa84be78260f03 
+EPASS_USB_RESPONDER_VERSION = 2aa8de07d0753821c27effdf4950c8bad815c889
 EPASS_USB_RESPONDER_SITE = https://github.com/rhodesepass/epass_usb_responder.git
 EPASS_USB_RESPONDER_SITE_METHOD = git
 EPASS_USB_RESPONDER_DEPENDENCIES = 

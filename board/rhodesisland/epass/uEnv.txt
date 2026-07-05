@@ -1,4 +1,4 @@
-bootargs=console=ttyS0,115200 console=tty0 panic=5 rootwait mtdparts=spi0.0:1M(u-boot)ro,6M(boot),-(rootfs) root=ubi0:rootfs earlyprintk rw rootfstype=ubifs ubi.mtd=2
+bootargs=console=ttyS0,115200 panic=5 rootwait mtdparts=spi0.0:1M(u-boot)ro,6M(boot),-(rootfs) root=ubi0:rootfs earlyprintk rw rootfstype=ubifs ubi.mtd=2
 interface=
 ext=
 
