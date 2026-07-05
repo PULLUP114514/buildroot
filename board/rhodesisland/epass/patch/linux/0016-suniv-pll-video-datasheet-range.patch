@@ -1,0 +1,54 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] clk: sunxi-ng: suniv: constrain pll-video to the datasheet range
+
+Experimenting with a 30 Hz mode for the hsd-nv3052 panel (812x1306 @
+31.814 MHz) produced a real refresh rate of ~24.75 Hz, measured by
+counting the TCON vblank interrupt over 12 s (297 irqs), while
+clk_summary happily reported the promised rate.
+
+Root cause chain:
+
+  1. sun4i_dclk_round_rate() scans dividers 6..127 and takes the
+     first divider whose parent clock request rounds *exactly*.
+  2. For 31.814 MHz the first exact hit is div=43, which asks
+     pll-video for 43 x 31.814 = 1368 MHz (24 MHz x 57, M=1) - a
+     perfectly representable N/M combination, so the ccu math is
+     happy to promise it.
+  3. The F1C100s/200s datasheet (3.2.5.3 PLL_VIDEO Control Register)
+     says: "The PLL output clock must be in the range of
+     30MHz~600MHz." At 1368 MHz the PLL does not lock anywhere near
+     the programmed rate and the pixel clock lands ~18% low.
+
+Declare the datasheet range with the existing
+SUNXI_CCU_NM_WITH_FRAC_GATE_LOCK_MIN_MAX macro (same thing A64 does
+for its video PLLs). clk_round_rate() then refuses to promise
+out-of-range rates and sun4i_dclk_round_rate() settles on an
+achievable divider. pll-ve is left alone: the VE clock only ever
+requests 432 MHz, already in range.
+
+The panel keeps its stock 40 Hz raster: the NV3052 init sequence
+programs the controller for the 812x1306 raster, and a mode with
+different h/v totals (tried 800x1375 for an exact 30 Hz) loses sync
+entirely. 42.418 MHz x 7 rounds to 297 MHz - the PLL fractional
+sweet spot - so the 40 Hz mode is unaffected by the clamp; the clamp
+just keeps any future mode experiment honest instead of silently
+undershooting.
+
+--- a/drivers/clk/sunxi-ng/ccu-suniv-f1c100s.c
++++ b/drivers/clk/sunxi-ng/ccu-suniv-f1c100s.c
+@@ -59,8 +59,14 @@
+ 				   BIT(28),		/* lock */
+ 				   CLK_SET_RATE_UNGATE);
+ 
+-static SUNXI_CCU_NM_WITH_FRAC_GATE_LOCK(pll_video_clk, "pll-video",
++/* Datasheet 3.2.5.3: output must stay within 30MHz~600MHz. Without the
++ * clamp, sun4i_dclk_round_rate() happily locks onto exact N/M hits far
++ * above the VCO's reach (e.g. 1368 MHz) and the real pixel clock lands
++ * ~18% low. */
++static SUNXI_CCU_NM_WITH_FRAC_GATE_LOCK_MIN_MAX(pll_video_clk, "pll-video",
+ 					"osc24M", 0x010,
++					30000000,	/* min rate */
++					600000000,	/* max rate */
+ 					8, 7,		/* N */
+ 					0, 4,		/* M */
+ 					BIT(24),	/* frac enable */

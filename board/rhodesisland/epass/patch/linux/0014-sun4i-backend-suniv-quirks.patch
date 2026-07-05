@@ -1,0 +1,83 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sun4i: backend: add dedicated suniv F1C100s quirks
+
+The suniv DT node lists "allwinner,suniv-f1c100s-display-backend"
+ahead of the "allwinner,sun4i-a10-display-backend" fallback, but
+sun4i_backend has no entry for it, so the F1C100s/F1C200s DEBE runs
+with the A10 quirks and inherits supports_lowest_plane_alpha = false.
+
+That flag guards an erratum of the early SoCs where the lowest plane
+of pipe 0, if it carries any alpha, discards its pixel data and shows
+the background color instead. With it unset, atomic_check rejects any
+configuration whose lowest enabled plane has a non-opaque global
+alpha, and allows only one alpha-carrying plane in total.
+
+The epass layer layout is:
+
+  layer 0 (zpos 0): video, tiled NV12 through the DEFE frontend
+  layer 1 (zpos 1): overlay, ARGB8888, faded via the plane "alpha"
+                    property (parked at 0 = fully transparent)
+  layer 2 (zpos 2): UI, RGB565
+
+While the video layer is enabled every commit passes: the lowest
+plane is opaque NV12. But any commit that disables layer 0
+renormalizes zpos and the ARGB overlay with alpha < 0xFFFF becomes
+the lowest plane -> -EINVAL. The kernel generates exactly such a
+commit by itself in atomic_remove_fb(), when userspace removes a
+framebuffer still bound to the video plane: the plane-only disable
+is rejected by the quirk check, and the disable-the-CRTC retry is
+rejected too because the internal state has allow_modeset = false
+(drm_atomic_check_only() refuses the implied modeset). Observed on
+F1C200s as:
+
+  WARNING: CPU: 0 PID: 9 at drivers/gpu/drm/drm_framebuffer.c:991
+  atomic remove_fb failed with -22
+    drm_mode_rmfb_work_fn -> drm_framebuffer_remove -> atomic_remove_fb
+
+with the plane left scanning out a framebuffer that no longer has an
+ID. The same check would also reject legitimate future configs
+(e.g. overlay fade-in while the video layer is off).
+
+The lowest-plane-alpha erratum is only documented for the first
+DEBE generation (A10/A13/A20 quirks all leave the flag unset); the
+suniv blocks are later cuts of the IP (its VE is the A31-generation
+core, see the cedrus suniv patch). Assume the DEBE matches the
+A23/A33 behaviour and give suniv its own quirks with
+supports_lowest_plane_alpha = true, which also lifts the alpha-plane
+budget from 1 to 2.
+
+That assumption is the one thing to verify on silicon: disable the
+video plane, give the ARGB overlay a global alpha below 0xFFFF, and
+check that its pixels still blend instead of collapsing to the
+background color, e.g.
+
+  modetest -M sun4i-drm -s <conn>@<crtc>:<mode> \
+    -P <overlay_plane>@<crtc>:<w>x<h>@AR24 -w <overlay_plane>:alpha:32768
+
+If the erratum does reproduce, flip supports_lowest_plane_alpha back
+to false and keep only the dedicated match entry.
+
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -1000,6 +1000,10 @@
+ static const struct sun4i_backend_quirks sun9i_backend_quirks = {
+ };
+ 
++static const struct sun4i_backend_quirks suniv_backend_quirks = {
++	.supports_lowest_plane_alpha = true,
++};
++
+ static const struct of_device_id sun4i_backend_of_table[] = {
+ 	{
+ 		.compatible = "allwinner,sun4i-a10-display-backend",
+@@ -1029,6 +1033,10 @@
+ 		.compatible = "allwinner,sun9i-a80-display-backend",
+ 		.data = &sun9i_backend_quirks,
+ 	},
++	{
++		.compatible = "allwinner,suniv-f1c100s-display-backend",
++		.data = &suniv_backend_quirks,
++	},
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, sun4i_backend_of_table);
