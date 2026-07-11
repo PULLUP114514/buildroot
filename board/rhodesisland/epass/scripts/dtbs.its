@@ -136,21 +136,21 @@
 
         /* boot splash logos (pre-gzipped RGB565 raw, gunzipped by imxtract) */
         logo-hsd {
-            description = "splash logo 384x640 RGB565";
+            description = "splash logo 360x640 RGB565";
             data = /incbin/("./logo-mostima.rgb565.gz");
             type = "firmware";
             arch = "arm";
             compression = "gzip";
         };
         logo-boe {
-            description = "splash logo 384x640 RGB565";
+            description = "splash logo 360x640 RGB565";
             data = /incbin/("./logo-mostima.rgb565.gz");
             type = "firmware";
             arch = "arm";
             compression = "gzip";
         };
         logo-laowu {
-            description = "splash logo 384x640 RGB565";
+            description = "splash logo 360x640 RGB565";
             data = /incbin/("./logo-mostima.rgb565.gz");
             type = "firmware";
             arch = "arm";

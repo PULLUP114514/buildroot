@@ -27,9 +27,8 @@ import numpy as np
 from PIL import Image
 
 # scanout = DEBE/TCON 出的分辨率;visible = 面板实际可见区(在 scanout 里的偏移)
-# mostima 屏 hactive=384 里只有左侧 360 可见(时序对齐用的 24px 在右侧)
 PANELS = {
-    "mostima": {"scanout": (384, 640), "visible": (360, 640), "offset": (0, 0)},
+    "mostima": {"scanout": (360, 640), "visible": (360, 640), "offset": (0, 0)},
     "hsd_nv3052": {"scanout": (720, 1280), "visible": (720, 1280), "offset": (0, 0)},
 }
 
