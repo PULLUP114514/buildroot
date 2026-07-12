@@ -11,6 +11,8 @@ menu "Target packages"
 
 menu "Audio and video applications"
 	source "package/epass_drm_app/Config.in"
+	source "package/epass_applications/Config.in"
+	source "package/epass-fonts/Config.in"
 	source "package/epass_usb_responder/Config.in"
 	source "package/epassctl/Config.in"
 	source "package/usb_aio_handler/Config.in"

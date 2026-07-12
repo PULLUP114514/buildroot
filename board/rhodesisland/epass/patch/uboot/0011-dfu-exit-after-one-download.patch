@@ -1,0 +1,64 @@
+diff --git a/common/dfu.c b/common/dfu.c
+index 491cd93a..4e457788 100644
+--- a/common/dfu.c
++++ b/common/dfu.c
+@@ -22,7 +22,6 @@
+ 
+ int run_usb_dnl_gadget(int usbctrl_index, char *usb_dnl_gadget)
+ {
+-	bool dfu_reset = false;
+ 	int ret, i = 0;
+ 
+ 	ret = usb_gadget_initialize(usbctrl_index);
+@@ -43,16 +42,6 @@ int run_usb_dnl_gadget(int usbctrl_index, char *usb_dnl_gadget)
+ 
+ 	while (1) {
+ 		if (g_dnl_detach()) {
+-			/*
+-			 * Check if USB bus reset is performed after detach,
+-			 * which indicates that -R switch has been passed to
+-			 * dfu-util. In this case reboot the device
+-			 */
+-			if (dfu_usb_get_reset()) {
+-				dfu_reset = true;
+-				goto exit;
+-			}
+-
+ 			/*
+ 			 * This extra number of usb_gadget_handle_interrupts()
+ 			 * calls is necessary to assure correct transmission
+@@ -104,9 +94,6 @@ exit:
+ 	g_dnl_unregister();
+ 	usb_gadget_release(usbctrl_index);
+ 
+-	if (dfu_reset)
+-		do_reset(NULL, 0, 0, NULL);
+-
+ 	g_dnl_clear_detach();
+ 
+ 	return ret;
+diff --git a/drivers/usb/gadget/f_dfu.c b/drivers/usb/gadget/f_dfu.c
+index 4bedc7d8..e8153876 100644
+--- a/drivers/usb/gadget/f_dfu.c
++++ b/drivers/usb/gadget/f_dfu.c
+@@ -173,6 +173,11 @@ static void dnload_request_flush(struct usb_ep *ep, struct usb_request *req)
+ 	dfu_set_defer_flush(dfu_get_entity(f_dfu->altsetting));
+ }
+ 
++static void dnload_request_detach(struct usb_ep *ep, struct usb_request *req)
++{
++	g_dnl_trigger_detach();
++}
++
+ static inline int dfu_get_manifest_timeout(struct dfu_entity *dfu)
+ {
+ 	return dfu->poll_timeout ? dfu->poll_timeout(dfu) :
+@@ -490,7 +495,8 @@ static int state_dfu_manifest(struct f_dfu *f_dfu,
+ 		value = handle_getstatus(req);
+ 		f_dfu->blk_seq_num = 0;
+-		puts("DOWNLOAD ... OK\nCtrl+C to exit ...\n");
++		puts("DOWNLOAD ... OK\n");
++		req->complete = dnload_request_detach;
+ 		break;
+ 	case USB_REQ_DFU_GETSTATE:
+ 		value = handle_getstate(req);

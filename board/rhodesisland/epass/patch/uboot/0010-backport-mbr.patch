@@ -1,0 +1,650 @@
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index 8821df7f..a44e5c3a 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -998,6 +998,14 @@ config CMD_GPT
+ 	  Enable the 'gpt' command to ready and write GPT style partition
+ 	  tables.
+ 
++config CMD_MBR
++	bool "MBR (Master Boot Record) command"
++	select DOS_PARTITION
++	select HAVE_BLOCK_DEVICE
++	help
++	  Enable the 'mbr' command to read and write MBR (Master Boot Record)
++	  style partition tables.
++
+ config RANDOM_UUID
+ 	bool "GPT Random UUID generation"
+ 	select LIB_UUID
+diff --git a/cmd/Makefile b/cmd/Makefile
+index f4aed852..5121404e 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -168,6 +168,7 @@ obj-$(CONFIG_CMD_ZFS) += zfs.o
+ 
+ obj-$(CONFIG_CMD_DFU) += dfu.o
+ obj-$(CONFIG_CMD_GPT) += gpt.o
++obj-$(CONFIG_CMD_MBR) += mbr.o
+ obj-$(CONFIG_CMD_ETHSW) += ethsw.o
+ obj-$(CONFIG_CMD_AXI) += axi.o
+ 
+diff --git a/cmd/mbr.c b/cmd/mbr.c
+new file mode 100644
+index 00000000..447b4c1a
+--- /dev/null
++++ b/cmd/mbr.c
+@@ -0,0 +1,324 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * cmd_mbr.c -- MBR (Master Boot Record) handling command
++ *
++ * Copyright (C) 2020 Samsung Electronics
++ * author: Marek Szyprowski <m.szyprowski@samsung.com>
++ *
++ * based on the gpt command.
++ */
++
++#include <common.h>
++#include <blk.h>
++#include <command.h>
++#include <env.h>
++#include <part.h>
++#include <linux/ctype.h>
++#include <linux/string.h>
++#include <malloc.h>
++
++/**
++ * extract_val() - Extract a value from the key=value pair list
++ * @str: pointer to string with key=values pairs
++ * @key: pointer to the key to search for
++ *
++ * Return: Pointer to allocated string with the value, or NULL.
++ */
++static char *extract_val(const char *str, const char *key)
++{
++	char *v, *k;
++	char *s, *strcopy;
++	char *new = NULL;
++
++	strcopy = strdup(str);
++	if (strcopy == NULL)
++		return NULL;
++
++	s = strcopy;
++	while (s) {
++		v = strsep(&s, ",");
++		if (!v)
++			break;
++		k = strsep(&v, "=");
++		if (!k)
++			break;
++		if (strcmp(k, key) == 0) {
++			new = strdup(v);
++			break;
++		}
++	}
++
++	free(strcopy);
++
++	return new;
++}
++
++/**
++ * found_key() - Search for a key without a value in the parameter list
++ * @str: pointer to string with key
++ * @key: pointer to the key to search for
++ *
++ * Return: true if key has been found.
++ */
++static bool found_key(const char *str, const char *key)
++{
++	char *k;
++	char *s, *strcopy;
++	bool result = false;
++
++	strcopy = strdup(str);
++	if (!strcopy)
++		return false;
++
++	s = strcopy;
++	while (s) {
++		k = strsep(&s, ",");
++		if (!k)
++			break;
++		if (strcmp(k, key) == 0) {
++			result = true;
++			break;
++		}
++	}
++
++	free(strcopy);
++
++	return result;
++}
++
++static int str_to_partitions(const char *str_part, int blksz,
++			     unsigned long *disk_uuid,
++			     struct disk_partition **partitions,
++			     int *parts_count)
++{
++	char *tok, *str, *s;
++	int i;
++	char *val, *p;
++	int p_count;
++	struct disk_partition *parts;
++	int errno = 0;
++	u64 size_ll, start_ll;
++
++	if (str_part == NULL)
++		return -1;
++
++	str = strdup(str_part);
++	if (str == NULL)
++		return -ENOMEM;
++
++	/* extract disk uuid */
++	s = str;
++	val = extract_val(str, "uuid_disk");
++	if (val) {
++		val = strsep(&val, ";");
++		p = val;
++		*disk_uuid = ustrtoull(p, &p, 0);
++		free(val);
++		/* Move s to first partition */
++		strsep(&s, ";");
++	}
++	if (s == NULL) {
++		printf("Error: is the partitions string NULL-terminated?\n");
++		free(str);
++		return -EINVAL;
++	}
++
++	/* remove the optional semicolon at the end of the string */
++	i = strlen(s) - 1;
++	if (i >= 0 && s[i] == ';')
++		s[i] = '\0';
++
++	/* calculate expected number of partitions */
++	p_count = 1;
++	p = s;
++	while (*p) {
++		if (*p++ == ';')
++			p_count++;
++	}
++
++	/* allocate memory for partitions */
++	parts = calloc(sizeof(struct disk_partition), p_count);
++	if (parts == NULL) {
++		free(str);
++		return -ENOMEM;
++	}
++
++	/* retrieve partitions data from string */
++	for (i = 0; i < p_count; i++) {
++		tok = strsep(&s, ";");
++
++		if (tok == NULL)
++			break;
++
++		/* size */
++		val = extract_val(tok, "size");
++		if (!val) { /* 'size' is mandatory */
++			errno = -4;
++			goto err;
++		}
++		p = val;
++		if ((strcmp(p, "-") == 0)) {
++			/* auto extend the size */
++			parts[i].size = 0;
++		} else {
++			size_ll = ustrtoull(p, &p, 0);
++			parts[i].size = size_ll / blksz;
++		}
++		free(val);
++
++		/* start address */
++		val = extract_val(tok, "start");
++		if (val) { /* start address is optional */
++			p = val;
++			start_ll = ustrtoull(p, &p, 0);
++			parts[i].start = start_ll / blksz;
++			free(val);
++		}
++
++		/* system id */
++		val = extract_val(tok, "id");
++		if (!val) { /* 'id' is mandatory */
++			errno = -4;
++			goto err;
++		}
++		p = val;
++		parts[i].sys_ind = ustrtoul(p, &p, 0);
++		free(val);
++
++		/* bootable */
++		if (found_key(tok, "bootable"))
++			parts[i].bootable = PART_BOOTABLE;
++	}
++
++	*parts_count = p_count;
++	*partitions = parts;
++	free(str);
++
++	return 0;
++err:
++	free(str);
++	free(parts);
++
++	return errno;
++}
++
++static int do_write_mbr(struct blk_desc *dev, const char *str)
++{
++	unsigned long disk_uuid = 0;
++	struct disk_partition *partitions;
++	int blksz = dev->blksz;
++	int count;
++
++	if (str_to_partitions(str, blksz, &disk_uuid, &partitions, &count)) {
++		printf("MBR: failed to setup partitions from \"%s\"\n", str);
++		return -1;
++	}
++
++	if (layout_mbr_partitions(partitions, count, dev->lba)) {
++		printf("MBR: failed to layout partitions on the device\n");
++		free(partitions);
++		return -1;
++	}
++
++	if (write_mbr_partitions(dev, partitions, count, disk_uuid)) {
++		printf("MBR: failed to write partitions to the device\n");
++		free(partitions);
++		return -1;
++	}
++
++	free(partitions);
++
++	return 0;
++}
++
++static int do_verify_mbr(struct blk_desc *dev, const char *str)
++{
++	unsigned long disk_uuid = 0;
++	struct disk_partition *partitions;
++	int blksz = dev->blksz;
++	int count, i, ret = 1;
++
++	if (str_to_partitions(str, blksz, &disk_uuid, &partitions, &count)) {
++		printf("MBR: failed to setup partitions from \"%s\"\n", str);
++		return -1;
++	}
++
++	for (i = 0; i < count; i++) {
++		struct disk_partition p;
++
++		if (part_get_info_by_type(dev, i + 1, PART_TYPE_DOS, &p))
++			goto fail;
++
++		if ((partitions[i].size && p.size != partitions[i].size) ||
++		    (partitions[i].start && p.start != partitions[i].start) ||
++		    p.sys_ind != partitions[i].sys_ind)
++			goto fail;
++	}
++	ret = 0;
++fail:
++	free(partitions);
++	return ret;
++}
++
++static int do_mbr(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	const char *parts = NULL;
++	int ret = CMD_RET_SUCCESS;
++	int dev = 0;
++	char *ep;
++	struct blk_desc *blk_dev_desc = NULL;
++
++	if (argc != 4 && argc != 5)
++		return CMD_RET_USAGE;
++
++	dev = (int)simple_strtoul(argv[3], &ep, 10);
++	if (!ep || ep[0] != '\0') {
++		printf("'%s' is not a number\n", argv[3]);
++		return CMD_RET_USAGE;
++	}
++	blk_dev_desc = blk_get_dev(argv[2], dev);
++	if (!blk_dev_desc) {
++		printf("%s: %s dev %d NOT available\n",
++		       __func__, argv[2], dev);
++		return CMD_RET_FAILURE;
++	}
++
++	if ((strcmp(argv[1], "write") == 0)) {
++		parts = (argc == 5) ? argv[4] : env_get("mbr_parts");
++		if (!parts) {
++			printf("No partition list provided\n");
++			return CMD_RET_USAGE;
++		}
++		printf("MBR: write ");
++		ret = do_write_mbr(blk_dev_desc, parts);
++	} else if ((strcmp(argv[1], "verify") == 0)) {
++		parts = (argc == 5) ? argv[4] : env_get("mbr_parts");
++		if (!parts) {
++			printf("No partition list provided\n");
++			return CMD_RET_USAGE;
++		}
++		printf("MBR: verify ");
++		ret = do_verify_mbr(blk_dev_desc, parts);
++	} else {
++		return CMD_RET_USAGE;
++	}
++
++	if (ret) {
++		printf("error!\n");
++		return CMD_RET_FAILURE;
++	}
++
++	printf("success!\n");
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(mbr, CONFIG_SYS_MAXARGS, 1, do_mbr,
++	   "MBR (Master Boot Record)",
++	   "<command> <interface> <dev> [partitions_list]\n"
++	   " - MBR partition table restoration utility\n"
++	   " Restore or check partition information on a device connected\n"
++	   " to the given block interface\n"
++	   " Example usage:\n"
++	   " mbr write mmc 0 [\"${mbr_parts}\"]\n"
++	   " mbr verify mmc 0 [\"${mbr_parts}\"]\n"
++);
+diff --git a/disk/part.c b/disk/part.c
+index f6a31025..2fc94aae 100644
+--- a/disk/part.c
++++ b/disk/part.c
+@@ -319,6 +319,40 @@ void part_print(struct blk_desc *dev_desc)
+ 
+ #endif /* CONFIG_HAVE_BLOCK_DEVICE */
+ 
++int part_get_info_by_type(struct blk_desc *dev_desc, int part, int part_type,
++			  struct disk_partition *info)
++{
++#ifdef CONFIG_HAVE_BLOCK_DEVICE
++	struct part_driver *drv =
++		ll_entry_start(struct part_driver, part_driver);
++	const int n_ents = ll_entry_count(struct part_driver, part_driver);
++	struct part_driver *entry;
++
++#if CONFIG_IS_ENABLED(PARTITION_UUIDS)
++	if (info)
++		info->uuid[0] = 0;
++#endif
++#ifdef CONFIG_PARTITION_TYPE_GUID
++	if (info)
++		info->type_guid[0] = 0;
++#endif
++
++	for (entry = drv; entry != drv + n_ents; entry++) {
++		if (part_type != PART_TYPE_UNKNOWN &&
++		    entry->part_type != part_type)
++			continue;
++		if (entry->test && entry->test(dev_desc))
++			continue;
++		if (!entry->get_info)
++			continue;
++		if (!entry->get_info(dev_desc, part, info))
++			return 0;
++	}
++#endif
++
++	return -1;
++}
++
+ int part_get_info(struct blk_desc *dev_desc, int part,
+ 		       struct disk_partition *info)
+ {
+diff --git a/disk/part_dos.c b/disk/part_dos.c
+index 04f53106..8aa35a34 100644
+--- a/disk/part_dos.c
++++ b/disk/part_dos.c
+@@ -17,6 +17,7 @@
+ #include <blk.h>
+ #include <command.h>
+ #include <ide.h>
++#include <log.h>
+ #include <memalign.h>
+ #include "part_dos.h"
+ #include <part.h>
+@@ -329,6 +330,187 @@ int is_valid_dos_buf(void *buf)
+ 	return test_block_type(buf) == DOS_MBR ? 0 : -1;
+ }
+ 
++#if CONFIG_IS_ENABLED(CMD_MBR)
++static void set_le32(unsigned char *p, u32 val)
++{
++	p[0] = val & 0xff;
++	p[1] = (val >> 8) & 0xff;
++	p[2] = (val >> 16) & 0xff;
++	p[3] = (val >> 24) & 0xff;
++}
++
++static void lba_to_chs(lbaint_t lba, unsigned char *rc, unsigned char *rh,
++		       unsigned char *rs)
++{
++	unsigned int c, h, s;
++	unsigned int sectpertrack = 63;
++	unsigned int heads = 255;
++
++	c = (lba + 1) / sectpertrack / heads;
++	h = (lba + 1) / sectpertrack - c * heads;
++	s = (lba + 1) - (c * heads + h) * sectpertrack;
++
++	if (c > 1023) {
++		c = 1023;
++		h = 254;
++		s = 63;
++	}
++
++	*rc = c & 0xff;
++	*rh = h;
++	*rs = s + ((c & 0x300) >> 2);
++}
++
++static void mbr_fill_pt_entry(dos_partition_t *pt, lbaint_t start,
++			      lbaint_t relative, lbaint_t size, uchar sys_ind,
++			      bool bootable)
++{
++	pt->boot_ind = bootable ? 0x80 : 0x00;
++	pt->sys_ind = sys_ind;
++	lba_to_chs(start, &pt->cyl, &pt->head, &pt->sector);
++	lba_to_chs(start + size - 1, &pt->end_cyl, &pt->end_head,
++		   &pt->end_sector);
++	set_le32(pt->start4, relative);
++	set_le32(pt->size4, size);
++}
++
++int write_mbr_partitions(struct blk_desc *dev,
++			 struct disk_partition *p, int count,
++			 unsigned int disksig)
++{
++	ALLOC_CACHE_ALIGN_BUFFER(unsigned char, buffer, dev->blksz);
++	lbaint_t ext_part_start = 0, ext_part_size = 0, ext_part_sect = 0;
++	dos_partition_t *pt;
++	int i;
++
++	memset(buffer, 0, dev->blksz);
++	buffer[DOS_PART_MAGIC_OFFSET] = 0x55;
++	buffer[DOS_PART_MAGIC_OFFSET + 1] = 0xaa;
++	set_le32(&buffer[DOS_PART_DISKSIG_OFFSET], disksig);
++	pt = (dos_partition_t *)(buffer + DOS_PART_TBL_OFFSET);
++
++	/* create all primary partitions */
++	for (i = 0; i < 4 && i < count; i++, pt++) {
++		mbr_fill_pt_entry(pt, p[i].start, p[i].start, p[i].size,
++				  p[i].sys_ind, p[i].bootable & PART_BOOTABLE);
++		if (is_extended(p[i].sys_ind)) {
++			ext_part_start = p[i].start;
++			ext_part_size = p[i].size;
++			ext_part_sect = p[i].start;
++		}
++	}
++
++	if (i < count && !ext_part_start) {
++		printf("%s: extended partition is needed for more than 4 partitions\n",
++		       __func__);
++		return -1;
++	}
++
++	/* write MBR */
++	if (blk_dwrite(dev, 0, 1, buffer) != 1) {
++		printf("%s: failed writing 'MBR' (1 blks at 0x0)\n",
++		       __func__);
++		return -1;
++	}
++
++	/* create extended volumes */
++	for (; i < count; i++) {
++		lbaint_t next_ebr = 0;
++
++		memset(buffer, 0, dev->blksz);
++		buffer[DOS_PART_MAGIC_OFFSET] = 0x55;
++		buffer[DOS_PART_MAGIC_OFFSET + 1] = 0xaa;
++		pt = (dos_partition_t *)(buffer + DOS_PART_TBL_OFFSET);
++
++		mbr_fill_pt_entry(pt, p[i].start, p[i].start - ext_part_sect,
++				  p[i].size, p[i].sys_ind,
++				  p[i].bootable & PART_BOOTABLE);
++
++		if (i + 1 < count) {
++			pt++;
++			next_ebr = p[i].start + p[i].size;
++			mbr_fill_pt_entry(pt, next_ebr, next_ebr - ext_part_start,
++					  p[i + 1].start + p[i + 1].size - next_ebr,
++					  DOS_PART_TYPE_EXTENDED, false);
++		}
++
++		/* write EBR */
++		if (blk_dwrite(dev, ext_part_sect, 1, buffer) != 1) {
++			printf("%s: failed writing 'EBR' (1 blks at 0x" LBAF ")\n",
++			       __func__, ext_part_sect);
++			return -1;
++		}
++		ext_part_sect = next_ebr;
++	}
++
++	part_init(dev);
++
++	return 0;
++}
++
++int layout_mbr_partitions(struct disk_partition *p, int count,
++			  lbaint_t total_sectors)
++{
++	struct disk_partition *ext = NULL;
++	int i, j;
++	lbaint_t ext_vol_start;
++
++	/* calculate primary partitions start and size if needed */
++	if (!p[0].start)
++		p[0].start = DOS_PART_DEFAULT_GAP;
++	for (i = 0; i < 4 && i < count; i++) {
++		if (!p[i].start)
++			p[i].start = p[i - 1].start + p[i - 1].size;
++		if (!p[i].size) {
++			lbaint_t end = total_sectors;
++			lbaint_t allocated = 0;
++
++			for (j = i + 1; j < 4 && j < count; j++) {
++				if (p[j].start) {
++					end = p[j].start;
++					break;
++				}
++				allocated += p[j].size;
++			}
++			p[i].size = end - allocated - p[i].start;
++		}
++		if (p[i].sys_ind == DOS_PART_TYPE_EXTENDED)
++			ext = &p[i];
++	}
++
++	if (count <= 4)
++		return 0;
++
++	if (!ext) {
++		log_err("extended partition is needed for more than 4 partitions\n");
++		return -EINVAL;
++	}
++
++	/* calculate extended volumes start and size if needed */
++	ext_vol_start = ext->start;
++	for (i = 4; i < count; i++) {
++		if (!p[i].start)
++			p[i].start = ext_vol_start + DOS_PART_DEFAULT_GAP;
++		if (!p[i].size) {
++			lbaint_t end = ext->start + ext->size;
++			lbaint_t allocated = 0;
++
++			for (j = i + 1; j < count; j++) {
++				if (p[j].start) {
++					end = p[j].start - DOS_PART_DEFAULT_GAP;
++					break;
++				}
++				allocated += p[j].size + DOS_PART_DEFAULT_GAP;
++			}
++			p[i].size = end - allocated - p[i].start;
++		}
++		ext_vol_start = p[i].start + p[i].size;
++	}
++
++	return 0;
++}
++#endif
++
+ int write_mbr_partition(struct blk_desc *dev_desc, void *buf)
+ {
+ 	if (is_valid_dos_buf(buf))
+diff --git a/disk/part_dos.h b/disk/part_dos.h
+index 434b021a..27e36945 100644
+--- a/disk/part_dos.h
++++ b/disk/part_dos.h
+@@ -16,6 +16,11 @@
+ #define DOS_MBR	0
+ #define DOS_PBR	1
+ 
++#define DOS_PART_TYPE_EXTENDED		0x05
++#define DOS_PART_TYPE_EXTENDED_LBA	0x0f
++#define DOS_PART_TYPE_EXTENDED_LINUX	0x85
++#define DOS_PART_DEFAULT_GAP		2048
++
+ typedef struct dos_partition {
+ 	unsigned char boot_ind;		/* 0x80 - active			*/
+ 	unsigned char head;		/* starting head			*/
+diff --git a/include/part.h b/include/part.h
+index 55be724d..ea70d3d0 100644
+--- a/include/part.h
++++ b/include/part.h
+@@ -105,6 +105,8 @@ struct blk_desc *mg_disk_get_dev(int dev);
+ int host_get_dev_err(int dev, struct blk_desc **blk_devp);
+ 
+ /* disk/part.c */
++int part_get_info_by_type(struct blk_desc *dev_desc, int part, int part_type,
++			  struct disk_partition *info);
+ int part_get_info(struct blk_desc *dev_desc, int part,
+ 		  struct disk_partition *info);
+ /**
+@@ -464,6 +466,14 @@ int get_disk_guid(struct blk_desc *dev_desc, char *guid);
+  */
+ int is_valid_dos_buf(void *buf);
+ 
++#if CONFIG_IS_ENABLED(CMD_MBR)
++int write_mbr_partitions(struct blk_desc *dev,
++			 struct disk_partition *p, int count,
++			 unsigned int disksig);
++int layout_mbr_partitions(struct disk_partition *p, int count,
++			  lbaint_t total_sectors);
++#endif
++
+ /**
+  * write_mbr_partition() - write DOS MBR
+  *

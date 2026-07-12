@@ -16,4 +16,5 @@
 .vscode
 
 /.bootenv.txt
+/.bootinfo.txt
 

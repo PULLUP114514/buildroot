@@ -1,3 +1,6 @@
 # 省两个常驻进程:内核日志直接走 console/dmesg,不再跑用户态 syslogd/klogd
 # CONFIG_SYSLOGD is not set
 # CONFIG_KLOGD is not set
+
+# 首次启动时在 SD 卡剩余空间上格式化 share 分区用
+CONFIG_MKFS_VFAT=y

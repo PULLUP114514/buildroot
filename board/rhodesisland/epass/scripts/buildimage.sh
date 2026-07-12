@@ -8,7 +8,6 @@ cp board/rhodesisland/epass/logo/*.rgb565.gz "${BINARIES_DIR}"
 MKIMAGE="${HOST_DIR}/bin/mkimage"
 DTBS_SLOT_SIZE=1048576
 KERNEL_SLOT_SIZE=5242880
-BOOT_IMAGE_SIZE=6291456
 
 cd "${BINARIES_DIR}"
 fakeroot sh -c "rm -r rootfs"
@@ -39,16 +38,59 @@ if [ "${kernel_size}" -gt "${KERNEL_SLOT_SIZE}" ]; then
     exit 1
 fi
 
-echo "building 6 MiB boot partition image..."
-dd if=/dev/zero bs="${BOOT_IMAGE_SIZE}" count=1 2>/dev/null | tr '\000' '\377' > boot.itb || exit 1
+echo "building bad-block-tolerant boot image..."
+dd if=/dev/zero bs="${DTBS_SLOT_SIZE}" count=1 2>/dev/null | tr '\000' '\377' > boot.itb || exit 1
 dd if=dtbs.itb of=boot.itb conv=notrunc 2>/dev/null || exit 1
 dd if=kernel.itb of=boot.itb bs="${DTBS_SLOT_SIZE}" seek=1 conv=notrunc 2>/dev/null || exit 1
 
 boot_size=$(wc -c < boot.itb)
-if [ "${boot_size}" -ne "${BOOT_IMAGE_SIZE}" ]; then
-    echo "boot.itb has unexpected size: ${boot_size} != ${BOOT_IMAGE_SIZE}" >&2
+expected_boot_size=$((DTBS_SLOT_SIZE + kernel_size))
+if [ "${boot_size}" -ne "${expected_boot_size}" ]; then
+    echo "boot.itb has unexpected size: ${boot_size} != ${expected_boot_size}" >&2
     exit 1
 fi
+
+echo "building bootfs.vfat..."
+rm -f bootfs.vfat
+# 8 MiB 太小放不下合法的 FAT32（簇数不足），用 FAT16。
+# 且必须用 -s 2（1KB 簇）保证簇数 >= 4085，否则按规范会被判定为 FAT12，
+# U-Boot/Linux 解析 FAT16 表时会错乱（"Invalid FAT entry"）
+dd if=/dev/zero of=bootfs.vfat bs=1M count=8 status=none
+"${HOST_DIR}/sbin/mkfs.vfat" -F 16 -s 2 -n BOOT bootfs.vfat
+"${HOST_DIR}/bin/mcopy" -i bootfs.vfat dtbs.itb ::dtbs.itb
+"${HOST_DIR}/bin/mcopy" -i bootfs.vfat kernel.itb ::kernel.itb
+
+# 默认 env.txt 是给直接 dd 烧卡的用户准备的(没有 xfel 写 env 的机会),
+# 可 dd 后在 PC 上挂载 boot 分区改 device_rev/screen。
+# xfel+DFU 流程里 sdflash 的 fatwrite 会用实际值覆盖它。
+cat > env.txt << 'EOF'
+bootargs=console=ttyS0,115200 panic=5 rootwait root=/dev/mmcblk0p2 rw rootfstype=ext4
+device_rev=0.6
+screen=hsd
+interface=
+ext=
+EOF
+"${HOST_DIR}/bin/mcopy" -i bootfs.vfat env.txt ::env.txt
+
+cat > README.txt << 'EOF'
+This is the boot partition of the ePass SD card image.
+
+IMPORTANT: env.txt defaults to device_rev=0.6, screen=hsd.
+If your hardware differs, edit env.txt BEFORE first boot,
+otherwise the device may boot with a wrong device tree / screen driver.
+
+  device_rev  board revision: 0.2 / 0.3 / 0.5 / 0.6
+  screen      panel type: hsd / boe / laowu / hsd_nv3052
+  interface   optional interface overlays (space separated), e.g. i2c0 uart1
+  ext         optional extension overlays, e.g. cardkb es8311_sound
+
+重要: env.txt 默认 device_rev=0.6, screen=hsd。
+如果与你的硬件不符, 请在首次开机前修改 env.txt,
+否则设备可能用错误的设备树/屏幕驱动启动。
+
+Do not touch dtbs.itb / kernel.itb.
+EOF
+"${HOST_DIR}/bin/mcopy" -i bootfs.vfat README.txt ::README.txt
 
 echo ============ start building SD Card image ============
 python3 gensdimage.py

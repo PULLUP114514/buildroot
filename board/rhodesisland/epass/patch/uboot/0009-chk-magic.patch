@@ -1,0 +1,87 @@
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index 192b3b26..8821df7f 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1745,6 +1745,12 @@ config CMD_MISC
+ 	help
+ 	  Delay execution for some time
+ 
++config CMD_MSTMCHK
++	bool "mstmchk"
++	default y
++	help
++	  Check Mostima marker at 0x80000000 and set mstm_ret env var
++
+ config MP
+ 	bool "support for multiprocessor"
+ 	help
+diff --git a/cmd/Makefile b/cmd/Makefile
+index 974ad48b..f4aed852 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -92,6 +92,7 @@ obj-$(CONFIG_CMD_MFSL) += mfsl.o
+ obj-$(CONFIG_CMD_MII) += mii.o
+ obj-$(CONFIG_CMD_MDIO) += mdio.o
+ obj-$(CONFIG_CMD_MISC) += misc.o
++obj-$(CONFIG_CMD_MSTMCHK) += mstmchk.o
+ obj-$(CONFIG_CMD_MMC) += mmc.o
+ obj-$(CONFIG_MP) += mp.o
+ obj-$(CONFIG_CMD_MTD) += mtd.o
+diff --git a/cmd/mstmchk.c b/cmd/mstmchk.c
+new file mode 100644
+index 00000000..c4e8f1a2
+--- /dev/null
++++ b/cmd/mstmchk.c
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Check Mostima marker at fixed DRAM address.
++ * Sets mstm_ret env var (0 = no marker, 1/2 = type byte).
++ * Do not use command return code: U-Boot $? is only 0/1.
++ */
++
++#include <common.h>
++#include <command.h>
++#include <env.h>
++#include <mapmem.h>
++
++#define MSTMCHK_ADDR	0x80000000UL
++#define MSTMCHK_MAGIC	0x5f616d6974736f4dULL	/* "Mostima_" */
++
++static int do_mstmchk(struct cmd_tbl *cmdtp, int flag, int argc,
++		      char *const argv[])
++{
++	void *buf;
++	u64 magic;
++	u8 next;
++	char val[4];
++
++	if (argc != 1)
++		return CMD_RET_USAGE;
++
++	env_set("mstm_ret", "0");
++
++	buf = map_sysmem(MSTMCHK_ADDR, 9);
++	if (!buf)
++		return CMD_RET_SUCCESS;
++
++	magic = *(u64 *)buf;
++	if (magic != MSTMCHK_MAGIC) {
++		unmap_sysmem(buf);
++		return CMD_RET_SUCCESS;
++	}
++
++	next = *((u8 *)buf + 8);
++	unmap_sysmem(buf);
++
++	snprintf(val, sizeof(val), "%u", next);
++	env_set("mstm_ret", val);
++
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(
++	mstmchk, 1, 0, do_mstmchk,
++	"check Mostima marker at 0x80000000",
++	""
++);

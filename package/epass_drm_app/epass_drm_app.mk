@@ -8,7 +8,9 @@
 EPASS_DRM_APP_VERSION = f45e4fdc3f939dcd2e24fee8b6e775414b740f21
 EPASS_DRM_APP_SITE = https://github.com/rhodesepass/drm_app_neo.git
 EPASS_DRM_APP_SITE_METHOD = git
-EPASS_DRM_APP_DEPENDENCIES = freetype libdrm libpng libevdev
+# epass-fonts: 提供 pkg-config 'epass-fonts', app 构建期据此取共享字体目录,
+# 不再自带字体 (字体由 epass-fonts 包装到 /usr/share/fonts/epass)。
+EPASS_DRM_APP_DEPENDENCIES = freetype libdrm libpng libevdev epass-fonts
 EPASS_DRM_APP_GIT_SUBMODULES = YES
 EPASS_DRM_APP_CONF_OPTS = -DBUILD_SHARED_LIBS=OFF --fresh
 
