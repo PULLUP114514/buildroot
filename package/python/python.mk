@@ -41,6 +41,7 @@ HOST_PYTHON_CONF_OPTS += \
 # Make python believe we don't have 'hg' and 'svn', so that it doesn't
 # try to communicate over the network during the build.
 HOST_PYTHON_CONF_ENV += \
+	CFLAGS="$(HOST_CFLAGS) -std=gnu17" \
 	LDFLAGS="$(HOST_LDFLAGS) -Wl,--enable-new-dtags" \
 	ac_cv_prog_HAS_HG=/bin/false \
 	ac_cv_prog_SVNVERSION=/bin/false

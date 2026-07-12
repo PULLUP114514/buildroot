@@ -1,0 +1,30 @@
+From 49fd04d77b3244c6c6990be41142168eef373aef Mon Sep 17 00:00:00 2001
+From: Rudi Heitbaum <rudi@heitbaum.com>
+Date: Fri, 22 Nov 2024 12:36:32 +0000
+Subject: [PATCH] libext2fs: fix -std=c23 build failure
+
+GCC 15 switched to -std=gnu23 by default.  In C23 bool is a keyword,
+so only provide the legacy typedef for C17 and earlier.
+
+Upstream: https://github.com/tytso/e2fsprogs/commit/49fd04d77b3244c6c6990be41142168eef373aef
+Signed-off-by: Rudi Heitbaum <rudi@heitbaum.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+---
+ lib/ext2fs/tdb.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/lib/ext2fs/tdb.c b/lib/ext2fs/tdb.c
+--- a/lib/ext2fs/tdb.c
++++ b/lib/ext2fs/tdb.c
+@@ -104,7 +104,9 @@ static char *rep_strdup(const char *s)
+ #endif
+ #endif
+ 
++#if defined __STDC__ && defined __STDC_VERSION__ && __STDC_VERSION__ <= 201710L
+ typedef int bool;
++#endif
+ 
+ #include "tdb.h"
+ 
+-- 
+2.43.0

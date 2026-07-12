@@ -37,6 +37,13 @@ UTIL_LINUX_CONF_OPTS += \
 
 HOST_UTIL_LINUX_DEPENDENCIES = host-pkgconf
 
+# util-linux 2.35.1 detects pidfd_open() and pidfd_send_signal() in recent
+# glibc, but predates <sys/pidfd.h> and therefore calls them without visible
+# prototypes.  Use its syscall fallback for the host build instead.
+HOST_UTIL_LINUX_CONF_ENV += \
+	ac_cv_func_pidfd_open=no \
+	ac_cv_func_pidfd_send_signal=no
+
 # We also don't want the host-python dependency
 HOST_UTIL_LINUX_CONF_OPTS = \
 	--without-systemd \

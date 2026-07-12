@@ -1,0 +1,87 @@
+From: David Gibson <david@gibson.dropbear.id.au>
+Date: Thu, 22 Jan 2026 13:53:18 +1100
+Subject: [PATCH] Fix discarded const qualifiers
+
+It's unsafe to implicitly discard the const qualifier on a pointer. In
+overlay_fixup_phandle(), this was probably just an oversight, and making
+the "sep" variable a const char * is sufficient to fix it.
+
+In create_node(), however, the "p" variable is directly modifying the
+buffer pointed to by "const char* node_name". To fix this, we need to
+actually make a duplicate of the buffer and operate on that instead.
+
+Adapted from upstream 9a1c801a1a3c for dtc 1.6.0 (uses xstrdup instead of
+xstrndup). Needed on hosts with glibc that use C23 memchr/strrchr generics,
+where -Werror=discarded-qualifiers breaks the build.
+
+Upstream: https://github.com/dgibson/dtc/commit/9a1c801a1a3c102bf95c5339c9e985b26b823a21
+Signed-off-by: Auto <auto@local>
+---
+ fdtput.c             | 25 ++++++++++++++++--------
+ libfdt/fdt_overlay.c |  3 ++-
+ 2 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/fdtput.c b/fdtput.c
+--- a/fdtput.c
++++ b/fdtput.c
+@@ -230,31 +230,38 @@ static int create_paths(char **blob, const char *in_path)
+ static int create_node(char **blob, const char *node_name)
+ {
+ 	int node = 0;
+-	char *p;
++	char *path, *namestart;
++	const char *p;
+ 
+ 	p = strrchr(node_name, '/');
+ 	if (!p) {
+ 		report_error(node_name, -1, -FDT_ERR_BADPATH);
+ 		return -1;
+ 	}
+-	*p = '\0';
+ 
+-	*blob = realloc_node(*blob, p + 1);
++	path = xstrdup(node_name);
++	namestart = path + (p - node_name);
++	*namestart = '\0';
+ 
+-	if (p > node_name) {
+-		node = fdt_path_offset(*blob, node_name);
++	*blob = realloc_node(*blob, namestart + 1);
++
++	if (namestart > path) {
++		node = fdt_path_offset(*blob, path);
+ 		if (node < 0) {
+ 			report_error(node_name, -1, node);
++			free(path);
+ 			return -1;
+ 		}
+ 	}
+ 
+-	node = fdt_add_subnode(*blob, node, p + 1);
++	node = fdt_add_subnode(*blob, node, namestart + 1);
+ 	if (node < 0) {
+-		report_error(p + 1, -1, node);
++		report_error(namestart + 1, -1, node);
++		free(path);
+ 		return -1;
+ 	}
+ 
++	free(path);
+ 	return 0;
+ }
+ 
+diff --git a/libfdt/fdt_overlay.c b/libfdt/fdt_overlay.c
+--- a/libfdt/fdt_overlay.c
++++ b/libfdt/fdt_overlay.c
+@@ -445,7 +445,8 @@ static int overlay_fixup_phandle(void *fdt, void *fdto, int symbols_off,
+ 		const char *fixup_str = value;
+ 		uint32_t path_len, name_len;
+ 		uint32_t fixup_len;
+-		char *sep, *endptr;
++		const char *sep;
++		char *endptr;
+ 		int poffset, ret;
+ 
+ 		fixup_end = memchr(value, '\0', len);
+-- 
+2.43.0

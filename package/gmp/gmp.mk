@@ -13,6 +13,11 @@ GMP_LICENSE_FILES = COPYING.LESSERv3 COPYINGv2
 GMP_DEPENDENCIES = host-m4
 HOST_GMP_DEPENDENCIES = host-m4
 
+# gcc-15 defaults to -std=gnu23; gmp-6.1.2 configure's "long long
+# reliability test" uses K&R empty parameter lists that C23 rejects,
+# so ABI detection fails with "could not find a working compiler".
+HOST_GMP_CONF_ENV = CFLAGS="$(HOST_CFLAGS) -std=gnu17"
+
 # GMP doesn't support assembly for coldfire or mips r6 ISA yet
 # Disable for ARM v7m since it has different asm constraints
 ifeq ($(BR2_m68k_cf)$(BR2_MIPS_CPU_MIPS32R6)$(BR2_MIPS_CPU_MIPS64R6)$(BR2_ARM_CPU_ARMV7M),y)

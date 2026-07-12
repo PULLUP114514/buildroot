@@ -10,6 +10,11 @@ M4_SITE = $(BR2_GNU_MIRROR)/m4
 M4_LICENSE = GPL-3.0+
 M4_LICENSE_FILES = COPYING
 HOST_M4_CONF_OPTS = --disable-static
-HOST_GAWK_CONF_ENV += CFLAGS="$(HOST_CFLAGS) -std=gnu99"
+
+# gcc-15 defaults to -std=gnu23 which is incorrectly detected and
+# generates build failures in the gnulib copy included in
+# m4-1.4.19. Force the previous gcc default (-std=gnu17).
+# Can be removed when m4 is updated to a version with fixed gnulib.
+HOST_M4_CONF_ENV = CFLAGS="$(HOST_CFLAGS) -std=gnu17"
 
 $(eval $(host-autotools-package))

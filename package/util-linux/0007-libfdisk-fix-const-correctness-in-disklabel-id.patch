@@ -1,0 +1,87 @@
+From: Buildroot compatibility fix <noreply@local>
+Date: Sun, 12 Jul 2026 16:08:00 +0800
+Subject: [PATCH] libfdisk: fix const correctness in disklabel ID setters
+
+The disklabel ID backport passes a const string to the non-interactive
+path, but the interactive path needs a writable pointer returned by
+fdisk_ask_string(). Keep those pointers separate so that the input remains
+const and only allocated interactive input is freed.
+
+Signed-off-by: Buildroot compatibility fix <noreply@local>
+---
+ libfdisk/src/dos.c | 10 ++++++----
+ libfdisk/src/gpt.c | 11 ++++++-----
+ 2 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/libfdisk/src/dos.c b/libfdisk/src/dos.c
+--- a/libfdisk/src/dos.c
++++ b/libfdisk/src/dos.c
+@@ -709,6 +709,6 @@ static int dos_create_disklabel(struct fdisk_context *cxt)
+ static int dos_set_disklabel_id(struct fdisk_context *cxt, const char *str)
+ {
+-	char *str0 = str;
++	char *input = NULL;
+ 	unsigned int id, old;
+ 	struct fdisk_dos_label *l;
+ 	int rc = 0;
+@@ -724,11 +724,13 @@ static int dos_set_disklabel_id(struct fdisk_context *cxt, const char *str)
+ 	old = mbr_get_id(cxt->firstsector);
+ 
+ 	if (!str)
+-		rc = fdisk_ask_string(cxt,
+-			_("Enter the new disk identifier"), &str);
++		rc = fdisk_ask_string(cxt, _("Enter the new disk identifier"),
++				     &input);
+ 	if (!rc) {
+ 		char *end = NULL;
+ 
++		if (input)
++			str = input;
+ 		errno = 0;
+ 		id = strtoul(str, &end, 0);
+ 		if (errno || str == end || (end && *end)) {
+@@ -737,8 +740,7 @@ static int dos_set_disklabel_id(struct fdisk_context *cxt, const char *str)
+ 		}
+ 	}
+ 
+-	if (!str0)
+-		free(str);
++	free(input);
+ 	if (rc)
+ 		return -EINVAL;
+ 
+diff --git a/libfdisk/src/gpt.c b/libfdisk/src/gpt.c
+--- a/libfdisk/src/gpt.c
++++ b/libfdisk/src/gpt.c
+@@ -2506,7 +2506,7 @@ static int gpt_set_disklabel_id(struct fdisk_context *cxt, const char *str)
+ {
+ 	struct fdisk_gpt_label *gpt;
+ 	struct gpt_guid uuid;
+-	char *old, *new;
++	char *input = NULL, *old, *new;
+ 	int rc;
+ 
+ 	assert(cxt);
+@@ -2515,13 +2515,14 @@ static int gpt_set_disklabel_id(struct fdisk_context *cxt, const char *str)
+ 
+ 	gpt = self_label(cxt);
+ 	if (!str) {
+-		if (fdisk_ask_string(cxt,
+-				_("Enter new disk UUID (in 8-4-4-4-12 format)"), &str))
++		if (fdisk_ask_string(
++			    cxt, _("Enter new disk UUID (in 8-4-4-4-12 format)"),
++			    &input))
+ 			return -EINVAL;
+-		rc = string_to_guid(str, &uuid);
+-		free(str);
+-	} else
+-		rc = string_to_guid(str, &uuid);
++		str = input;
++	}
++	rc = string_to_guid(str, &uuid);
++	free(input);
+ 
+ 	if (rc) {
+ 		fdisk_warnx(cxt, _("Failed to parse your UUID."));
+-- 
+2.43.0
