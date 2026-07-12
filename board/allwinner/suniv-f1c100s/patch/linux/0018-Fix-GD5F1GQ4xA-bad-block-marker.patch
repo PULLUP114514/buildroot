@@ -1,0 +1,20 @@
+---
+ drivers/mtd/nand/spi/gigadevice.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mtd/nand/spi/gigadevice.c b/drivers/mtd/nand/spi/gigadevice.c
+index 3eb4e8cef..f6eb67dc2 100644
+--- a/drivers/mtd/nand/spi/gigadevice.c
++++ b/drivers/mtd/nand/spi/gigadevice.c
+@@ -219,7 +219,8 @@ static const struct spinand_info gigadevice_spinand_table[] = {
+ 					      &update_cache_variants),
+ 		     SPINAND_HAS_QE_BIT,
+ 		     SPINAND_ECCINFO(&gd5fxgq4xa_ooblayout,
+-				     gd5fxgq4xa_ecc_get_status)),
++				     gd5fxgq4xa_ecc_get_status),
++			 .onchip_ecc_quirk = 1),
+ 	SPINAND_INFO("GD5F2GQ4xA", 0xF2,
+ 		     NAND_MEMORG(1, 2048, 64, 64, 2048, 40, 1, 1, 1),
+ 		     NAND_ECCREQ(8, 512),
+-- 
+2.17.1

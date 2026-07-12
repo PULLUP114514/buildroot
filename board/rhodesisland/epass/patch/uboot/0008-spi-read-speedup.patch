@@ -1,0 +1,219 @@
+From: Rhodes Island <epass@rhodesisland.local>
+Subject: [PATCH] sunxi: spi: speed up SPI-NAND reads (PIO fast path)
+
+Boot-time profiling on the F1C100s (ARM926 @ 600 MHz, SPI at 50 MHz)
+showed only ~2.2 MiB/s effective SPI-NAND read throughput, i.e. less
+than half of the 6.25 MiB/s wire speed.  The overhead is pure PIO cost:
+
+DM driver (drivers/spi/spi-sunxi.c):
+ - every transfer was split into FIFO-sized (63 byte) bursts, each of
+   which re-arms the counters, triggers XCH and polls for completion;
+ - RX-only transfers still stuffed the TX FIFO with dummy bytes, one
+   MMIO write per byte, roughly doubling the per-page MMIO traffic.
+
+Add an RX-only fast path: program the full length (BC is 24 bits wide)
+in a single burst with TC/BCC = 0 so the controller generates the dummy
+clocks itself, and drain the RX FIFO on the fly.  Transmit Pause (TP,
+already set in GCR by claim_bus) makes the controller stall SCLK when
+the RX FIFO is full, so this is safe at any CPU speed.
+
+SPL (arch/arm/mach-sunxi/spl_spi_sunxi.c):
+ - reads were issued in 60-byte chunks, paying a 4-byte command header
+   plus transfer re-arm per chunk;
+ - every NAND page switch burned a fixed 300 us udelay while tRD of the
+   supported chips is typically only a few tens of us.
+
+Set TP in the control register, drain the RX FIFO while the burst is
+running (which lifts the FIFO-size limit on a single command), read a
+whole 2048-byte page per command and poll the status register OIP bit
+instead of the fixed page-read delay.
+
+Measured on HYF1GQ4UDACAE: kernel FIT (2.6 MB) load time drops from
+~1130 ms to roughly wire speed, SPL U-Boot load time drops by ~40%.
+
+--- a/drivers/spi/spi-sunxi.c
++++ b/drivers/spi/spi-sunxi.c
+@@ -374,6 +374,64 @@
+ 	setbits_le32(SPI_REG(priv, SPI_FCR), SPI_BIT(priv, SPI_FCR_RF_RST) |
+ 		     SPI_BIT(priv, SPI_FCR_TF_RST));
+ 
++	if (!priv->tx_buf && priv->rx_buf) {
++		/*
++		 * RX-only fast path (the hot case for SPI-NAND page reads).
++		 *
++		 * The burst counter (BC) is 24 bits wide, so the whole
++		 * transfer fits in a single burst; with the transmit counter
++		 * (TC) set to 0 the controller clocks out the dummy bytes by
++		 * itself, no TX FIFO stuffing needed.  TP is set in GCR, so
++		 * the controller pauses whenever the RX FIFO is full and we
++		 * simply drain it as data trickles in.  Compared to the
++		 * generic path below this avoids re-arming the transfer and
++		 * writing a dummy byte for every 63 bytes received, which
++		 * used to dominate the transfer time on slow (ARM926) cores.
++		 */
++		while (len) {
++			u32 chunk = min_t(u32, len, SUN4I_MAX_XFER_SIZE);
++			u32 remain = chunk;
++			ulong start;
++
++			writel(SUN4I_BURST_CNT(chunk), SPI_REG(priv, SPI_BC));
++			writel(0, SPI_REG(priv, SPI_TC));
++			if (priv->variant->has_burst_ctl)
++				writel(0, SPI_REG(priv, SPI_BCTL));
++
++			setbits_le32(SPI_REG(priv, SPI_TCR),
++				     SPI_BIT(priv, SPI_TCR_XCH));
++
++			start = get_timer(0);
++			while (remain) {
++				rx_fifocnt = (readl(SPI_REG(priv, SPI_FSR)) &
++					SPI_BIT(priv, SPI_FSR_RF_CNT_MASK)) >>
++					SUN4I_FIFO_STA_RF_CNT_BITS;
++				if (!rx_fifocnt) {
++					if (get_timer(start) >
++					    SUN4I_SPI_TIMEOUT_US / 1000) {
++						printf("ERROR: sun4i_spi: Timeout transferring data\n");
++						sun4i_spi_set_cs(bus,
++								 slave_plat->cs,
++								 false);
++						return -ETIMEDOUT;
++					}
++					continue;
++				}
++				if (rx_fifocnt > remain)
++					rx_fifocnt = remain;
++				sun4i_spi_drain_fifo(priv, rx_fifocnt);
++				remain -= rx_fifocnt;
++				start = get_timer(0);
++			}
++			len -= chunk;
++		}
++
++		if (flags & SPI_XFER_END)
++			sun4i_spi_set_cs(bus, slave_plat->cs, false);
++
++		return 0;
++	}
++
+ 	while (len) {
+ 		/* Setup the transfer now... */
+ 		nbytes = min(len, (priv->variant->fifo_depth - 1));
+--- a/arch/arm/mach-sunxi/spl_spi_sunxi.c
++++ b/arch/arm/mach-sunxi/spl_spi_sunxi.c
+@@ -54,6 +54,7 @@
+ #define SUN4I_CTL_TF_RST            BIT(8)
+ #define SUN4I_CTL_RF_RST            BIT(9)
+ #define SUN4I_CTL_XCH               BIT(10)
++#define SUN4I_CTL_TP                BIT(18)
+ 
+ /*****************************************************************************/
+ /* SUN6I variant of the SPI controller                                       */
+@@ -71,6 +72,7 @@
+ 
+ #define SUN6I_CTL_ENABLE            BIT(0)
+ #define SUN6I_CTL_MASTER            BIT(1)
++#define SUN6I_CTL_TP                BIT(7)
+ #define SUN6I_CTL_SRST              BIT(31)
+ #define SUN6I_TCR_XCH               BIT(31)
+ 
+@@ -184,10 +186,17 @@
+ 		/* Wait for completion */
+ 		while (readl(base + SUN6I_SPI0_GCR) & SUN6I_CTL_SRST)
+ 			;
++		/*
++		 * Transmit Pause: hold SCLK while the RX FIFO is full so
++		 * bursts larger than the FIFO can be drained on the fly
++		 * without losing bytes.
++		 */
++		setbits_le32(base + SUN6I_SPI0_GCR, SUN6I_CTL_TP);
+ 	} else {
+ 		/* Enable SPI in the master mode and reset FIFO */
+ 		setbits_le32(base + SUN4I_SPI0_CTL, SUN4I_CTL_MASTER |
+ 						    SUN4I_CTL_ENABLE |
++						    SUN4I_CTL_TP |
+ 						    SUN4I_CTL_TF_RST |
+ 						    SUN4I_CTL_RF_RST);
+ 	}
+@@ -261,6 +270,8 @@
+ 				 ulong spi_tc_reg,
+ 				 ulong spi_bcc_reg)
+ {
++	u32 skip = ssize, remain = rsize, avail;
++
+ 	writel(ssize + rsize, spi_bc_reg); /* Burst counter (total bytes) */
+ 	writel(ssize, spi_tc_reg);           /* Transfer counter (bytes to send) */
+ 	if (spi_bcc_reg)
+@@ -273,17 +284,27 @@
+ 	/* Start the data transfer */
+ 	setbits_le32(spi_ctl_reg, spi_ctl_xch_bitmask);
+ 
+-	/* Wait until everything is received in the RX FIFO */
+-	while ((readl(spi_fifo_reg) & 0x7F) < ssize + rsize)
+-		;
+-
+-	/* Skip send bytes */
+-	for(u32 i = 0; i < ssize; i++)
+-		readb(spi_rx_reg);
+-
+-	/* Read the data */
+-	while (rsize-- > 0)
+-		*recv++ = readb(spi_rx_reg);
++	/*
++	 * Drain the RX FIFO on the fly.  With Transmit Pause set in the
++	 * control register the controller stalls SCLK whenever the FIFO
++	 * fills up, so bursts larger than the FIFO size are safe.  The
++	 * first ssize bytes are the echo of the command header and get
++	 * discarded.
++	 */
++	while (skip + remain) {
++		avail = readl(spi_fifo_reg) & 0x7F;
++		while (avail--) {
++			if (skip) {
++				readb(spi_rx_reg);
++				skip--;
++			} else if (remain) {
++				*recv++ = readb(spi_rx_reg);
++				remain--;
++			} else {
++				break;
++			}
++		}
++	}
+ 
+ 	/* tSHSL time is up to 100 ns in various SPI flash datasheets */
+ 	udelay(1);
+@@ -382,8 +403,18 @@
+ 		page = addr >> 11;
+ 		if (nandpage != page) {
+ 			u8 readcache[] = {0x13, (u8)(page >> 16), (u8)(page >> 8), (u8)(page)};
++			u8 getfeature[] = {0x0f, 0xc0};
++			u8 status;
++
+ 			spi0_transmit(readcache, 4, NULL, 0);
+-			udelay(300);
++			/*
++			 * Poll the OIP bit instead of waiting a fixed
++			 * worst-case 300 us: tRD is typically only a few
++			 * tens of us on the supported chips.
++			 */
++			do {
++				spi0_transmit(getfeature, 2, &status, 1);
++			} while (status & 0x01);
+ 			nandpage = page;
+ 		}
+ 		addr &= 0x7FF;
+@@ -426,7 +457,13 @@
+ 
+ /*****************************************************************************/
+ 
+-#define SPI_READ_MAX_SIZE 60 /* FIFO size, minus 4 bytes of the header */
++/*
++ * With Transmit Pause enabled and the RX FIFO drained on the fly there is
++ * no FIFO-size limit on a single burst anymore; reading a whole NAND page
++ * (or a large NOR chunk) per command gets rid of the 4-byte header and
++ * re-arm overhead for every 60 bytes of payload.
++ */
++#define SPI_READ_MAX_SIZE 2048
+ 
+ static void spi0_read_data(void *buf, u32 addr, u32 len)
+ {
