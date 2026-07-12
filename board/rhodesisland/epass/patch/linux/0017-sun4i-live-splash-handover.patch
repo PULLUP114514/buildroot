@@ -1,0 +1,354 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sun4i: preserve the suniv boot splash until userspace
+
+U-Boot can leave the suniv DEBE and TCON0 scanning an RGB565 splash
+framebuffer.  Preserve that live pipeline while the DRM component
+drivers bind, and expose a small release switch for the init script.
+
+The framebuffer is described by U-Boot as a reserved-memory node with
+compatible "srgn,splash-framebuffer".  On release, stop layer 0, latch
+the change, wait for the old scanout to drain, then return those pages
+to the buddy allocator.
+
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -28,6 +28,15 @@
+ #include "sun4i_layer.h"
+ #include "sunxi_engine.h"
+ 
++#include <linux/delay.h>
++#include <linux/kobject.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
++#include <linux/of_address.h>
++#include <linux/sysfs.h>
++
++static DEFINE_MUTEX(srgn_splash_lock);
++
+ struct sun4i_backend_quirks {
+ 	/* backend <-> TCON muxing selection done in backend */
+ 	bool needs_output_muxing;
+@@ -776,6 +785,113 @@ static struct regmap_config sun4i_backend_regmap_config = {
+ 	.max_register	= 0x5800,
+ };
+ 
++struct srgn_splash_handover {
++	struct sun4i_backend *backend;
++	struct kobject *kobj;
++	phys_addr_t start;
++	phys_addr_t size;
++	bool active;
++};
++
++static struct srgn_splash_handover srgn_splash;
++
++static ssize_t release_store(struct kobject *kobj,
++			     struct kobj_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct sun4i_backend *backend;
++	phys_addr_t addr, end;
++	unsigned long pfn;
++	int release;
++
++	if (kstrtoint(buf, 0, &release))
++		return -EINVAL;
++	if (!release)
++		return count;
++
++	mutex_lock(&srgn_splash_lock);
++	if (!srgn_splash.active) {
++		mutex_unlock(&srgn_splash_lock);
++		return count;
++	}
++
++	backend = srgn_splash.backend;
++
++	/*
++	 * Stop the U-Boot layer and latch the disable before its pages can
++	 * be reused.  Two 50 ms frame intervals cover every supported panel.
++	 */
++	regmap_update_bits(backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
++			   SUN4I_BACKEND_MODCTL_LAY_EN(0), 0);
++	sun4i_backend_commit(&backend->engine);
++	msleep(100);
++
++	addr = srgn_splash.start;
++	end = addr + srgn_splash.size;
++	for (; addr < end; addr += PAGE_SIZE) {
++		pfn = PHYS_PFN(addr);
++		if (pfn_valid(pfn) && PageReserved(pfn_to_page(pfn)))
++			free_reserved_page(pfn_to_page(pfn));
++	}
++
++	srgn_splash.active = false;
++	pr_info("srgn_splash: released %pa bytes at %pa\n",
++		&srgn_splash.size, &srgn_splash.start);
++	mutex_unlock(&srgn_splash_lock);
++
++	return count;
++}
++
++static struct kobj_attribute srgn_splash_release_attr =
++	__ATTR(release, 0200, NULL, release_store);
++
++static void srgn_splash_handover_init(struct device *dev,
++				       struct sun4i_backend *backend)
++{
++	struct device_node *np;
++	struct resource res;
++	int ret;
++
++	np = of_find_compatible_node(NULL, NULL, "srgn,splash-framebuffer");
++	if (!np) {
++		dev_warn(dev,
++			 "live scanout has no splash framebuffer reservation\n");
++		return;
++	}
++
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret) {
++		dev_warn(dev,
++			 "could not read splash framebuffer reservation\n");
++		return;
++	}
++
++	mutex_lock(&srgn_splash_lock);
++	srgn_splash.backend = backend;
++	srgn_splash.start = res.start;
++	srgn_splash.size = resource_size(&res);
++	srgn_splash.active = true;
++
++	srgn_splash.kobj = kobject_create_and_add("srgn_splash", kernel_kobj);
++	if (!srgn_splash.kobj) {
++		dev_warn(dev,
++			 "could not create splash release interface\n");
++		goto out;
++	}
++
++	ret = sysfs_create_file(srgn_splash.kobj,
++				&srgn_splash_release_attr.attr);
++	if (ret) {
++		kobject_put(srgn_splash.kobj);
++		srgn_splash.kobj = NULL;
++		dev_warn(dev,
++			 "could not create splash release attribute\n");
++	}
++out:
++	mutex_unlock(&srgn_splash_lock);
++}
++
+ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 			      void *data)
+ {
+@@ -786,6 +889,7 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 	const struct sun4i_backend_quirks *quirks;
+ 	struct resource *res;
+ 	void __iomem *regs;
++	bool live_scanout;
+ 	int i, ret;
+ 
+ 	backend = devm_kzalloc(dev, sizeof(*backend), GFP_KERNEL);
+@@ -793,6 +897,8 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 		return -ENOMEM;
+ 	dev_set_drvdata(dev, backend);
+ 	spin_lock_init(&backend->frontend_lock);
++	live_scanout = of_property_read_bool(dev->of_node,
++					     "srgn,live-scanout");
+ 
+ 	if (of_find_property(dev->of_node, "interconnects", NULL)) {
+ 		/*
+@@ -884,45 +991,54 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 
+ 	list_add_tail(&backend->engine.list, &drv->engine_list);
+ 
+-	/*
+-	 * Many of the backend's layer configuration registers have
+-	 * undefined default values. This poses a risk as we use
+-	 * regmap_update_bits in some places, and don't overwrite
+-	 * the whole register.
+-	 *
+-	 * Clear the registers here to have something predictable.
+-	 */
+-	for (i = 0x800; i < 0x1000; i += 4)
+-		regmap_write(backend->engine.regs, i, 0);
+-
+-	/* Disable registers autoloading */
+-	regmap_write(backend->engine.regs, SUN4I_BACKEND_REGBUFFCTL_REG,
+-		     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS);
+-
+-	/* Enable the backend */
+-	regmap_write(backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
+-		     SUN4I_BACKEND_MODCTL_DEBE_EN |
+-		     SUN4I_BACKEND_MODCTL_START_CTL);
+-
+-	/* Set output selection if needed */
+ 	quirks = of_device_get_match_data(dev);
+-	if (quirks->needs_output_muxing) {
++	if (!live_scanout) {
+ 		/*
+-		 * We assume there is no dynamic muxing of backends
+-		 * and TCONs, so we select the backend with same ID.
+-		 *
+-		 * While dynamic selection might be interesting, since
+-		 * the CRTC is tied to the TCON, while the layers are
+-		 * tied to the backends, this means, we will need to
+-		 * switch between groups of layers. There might not be
+-		 * a way to represent this constraint in DRM.
++		 * Many of the backend's layer configuration registers have
++		 * undefined default values. This poses a risk as we use
++		 * regmap_update_bits in some places, and don't overwrite
++		 * the whole register.
+ 		 */
+-		regmap_update_bits(backend->engine.regs,
+-				   SUN4I_BACKEND_MODCTL_REG,
+-				   SUN4I_BACKEND_MODCTL_OUT_SEL,
+-				   (backend->engine.id
+-				    ? SUN4I_BACKEND_MODCTL_OUT_LCD1
+-				    : SUN4I_BACKEND_MODCTL_OUT_LCD0));
++		for (i = 0x800; i < 0x1000; i += 4)
++			regmap_write(backend->engine.regs, i, 0);
++
++		/* Disable registers autoloading */
++		regmap_write(backend->engine.regs,
++			     SUN4I_BACKEND_REGBUFFCTL_REG,
++			     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS);
++
++		/* Enable the backend */
++		regmap_write(backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
++			     SUN4I_BACKEND_MODCTL_DEBE_EN |
++			     SUN4I_BACKEND_MODCTL_START_CTL);
++
++		/* Set output selection if needed */
++		if (quirks->needs_output_muxing)
++			regmap_update_bits(backend->engine.regs,
++					   SUN4I_BACKEND_MODCTL_REG,
++					   SUN4I_BACKEND_MODCTL_OUT_SEL,
++					   (backend->engine.id
++					    ? SUN4I_BACKEND_MODCTL_OUT_LCD1
++					    : SUN4I_BACKEND_MODCTL_OUT_LCD0));
++	} else {
++		u32 addr, attr, layer_size, modctl, stride;
++
++		dev_info(dev, "preserving U-Boot live scanout\n");
++		regmap_read(backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
++			    &modctl);
++		regmap_read(backend->engine.regs, SUN4I_BACKEND_LAYSIZE_REG(0),
++			    &layer_size);
++		regmap_read(backend->engine.regs,
++			    SUN4I_BACKEND_LAYLINEWIDTH_REG(0), &stride);
++		regmap_read(backend->engine.regs,
++			    SUN4I_BACKEND_LAYFB_L32ADD_REG(0), &addr);
++		regmap_read(backend->engine.regs, SUN4I_BACKEND_ATTCTL_REG1(0),
++			    &attr);
++		dev_info(dev,
++			 "live DEBE mod=%08x size=%08x stride=%08x addr=%08x attr=%08x modclk=%lu\n",
++			 modctl, layer_size, stride, addr, attr,
++			 clk_get_rate(backend->mod_clk));
++		srgn_splash_handover_init(dev, backend);
+ 	}
+ 
+ 	backend->quirks = quirks;
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -809,7 +809,8 @@ static struct regmap_config sun4i_tcon_regmap_config = {
+ };
+ 
+ static int sun4i_tcon_init_regmap(struct device *dev,
+-				  struct sun4i_tcon *tcon)
++				  struct sun4i_tcon *tcon,
++				  bool live_scanout)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct resource *res;
+@@ -827,14 +828,16 @@ static int sun4i_tcon_init_regmap(struct device *dev,
+ 		return PTR_ERR(tcon->regs);
+ 	}
+ 
+-	/* Make sure the TCON is disabled and all IRQs are off */
+-	regmap_write(tcon->regs, SUN4I_TCON_GCTL_REG, 0);
+-	regmap_write(tcon->regs, SUN4I_TCON_GINT0_REG, 0);
+-	regmap_write(tcon->regs, SUN4I_TCON_GINT1_REG, 0);
++	if (!live_scanout) {
++		/* Make sure the TCON is disabled and all IRQs are off */
++		regmap_write(tcon->regs, SUN4I_TCON_GCTL_REG, 0);
++		regmap_write(tcon->regs, SUN4I_TCON_GINT0_REG, 0);
++		regmap_write(tcon->regs, SUN4I_TCON_GINT1_REG, 0);
+ 
+-	/* Disable IO lines and set them to tristate */
+-	regmap_write(tcon->regs, SUN4I_TCON0_IO_TRI_REG, ~0);
+-	regmap_write(tcon->regs, SUN4I_TCON1_IO_TRI_REG, ~0);
++		/* Disable IO lines and set them to tristate */
++		regmap_write(tcon->regs, SUN4I_TCON0_IO_TRI_REG, ~0);
++		regmap_write(tcon->regs, SUN4I_TCON1_IO_TRI_REG, ~0);
++	}
+ 
+ 	return 0;
+ }
+@@ -1089,7 +1092,7 @@ static int sun4i_tcon_bind(struct device *dev, struct device *master,
+ 	struct device_node *remote;
+ 	struct sun4i_tcon *tcon;
+ 	struct reset_control *edp_rstc;
+-	bool has_lvds_rst, has_lvds_alt, can_lvds;
++	bool has_lvds_rst, has_lvds_alt, can_lvds, live_scanout;
+ 	int ret;
+ 
+ 	engine = sun4i_tcon_find_engine(drv, dev->of_node);
+@@ -1106,6 +1109,8 @@ static int sun4i_tcon_bind(struct device *dev, struct device *master,
+ 	tcon->dev = dev;
+ 	tcon->id = engine->id;
+ 	tcon->quirks = of_device_get_match_data(dev);
++	live_scanout = of_property_read_bool(dev->of_node,
++					     "srgn,live-scanout");
+ 
+ 	tcon->lcd_rst = devm_reset_control_get(dev, "lcd");
+ 	if (IS_ERR(tcon->lcd_rst)) {
+@@ -1127,8 +1132,14 @@ static int sun4i_tcon_bind(struct device *dev, struct device *master,
+ 		}
+ 	}
+ 
+-	/* Make sure our TCON is reset */
+-	ret = reset_control_reset(tcon->lcd_rst);
++	/*
++	 * A reset stops the U-Boot scanout.  Merely deassert the already
++	 * running block when a live handover was requested.
++	 */
++	if (live_scanout)
++		ret = reset_control_deassert(tcon->lcd_rst);
++	else
++		ret = reset_control_reset(tcon->lcd_rst);
+ 	if (ret) {
+ 		dev_err(dev, "Couldn't deassert our reset line\n");
+ 		return ret;
+@@ -1192,7 +1202,7 @@ static int sun4i_tcon_bind(struct device *dev, struct device *master,
+ 		goto err_assert_reset;
+ 	}
+ 
+-	ret = sun4i_tcon_init_regmap(dev, tcon);
++	ret = sun4i_tcon_init_regmap(dev, tcon, live_scanout);
+ 	if (ret) {
+ 		dev_err(dev, "Couldn't init our TCON regmap\n");
+ 		goto err_free_clocks;
+@@ -1204,6 +1214,21 @@ static int sun4i_tcon_bind(struct device *dev, struct device *master,
+ 			goto err_free_clocks;
+ 		}
+ 	}
++
++	if (live_scanout) {
++		u32 basic0, basic1, basic2, ctl, dclk;
++
++		regmap_read(tcon->regs, SUN4I_TCON0_CTL_REG, &ctl);
++		regmap_read(tcon->regs, SUN4I_TCON0_DCLK_REG, &dclk);
++		regmap_read(tcon->regs, SUN4I_TCON0_BASIC0_REG, &basic0);
++		regmap_read(tcon->regs, SUN4I_TCON0_BASIC1_REG, &basic1);
++		regmap_read(tcon->regs, SUN4I_TCON0_BASIC2_REG, &basic2);
++		dev_info(dev,
++			 "live TCON ctl=%08x dclk=%08x basic=%08x/%08x/%08x clocks=%lu/%lu/%lu\n",
++			 ctl, dclk, basic0, basic1, basic2,
++			 clk_get_rate(tcon->clk), clk_get_rate(tcon->sclk0),
++			 clk_get_rate(tcon->dclk));
++	}
+ 
+ 	ret = sun4i_tcon_init_irq(dev, tcon);
+ 	if (ret) {

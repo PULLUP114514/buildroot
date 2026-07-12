@@ -63,8 +63,20 @@ supervise() {
 
     remount_sd
 
-    # 收掉 u-boot splash:灭 DEBE layer 并把保留的显存还给 buddy
-    [ -w /sys/kernel/srgn_splash/release ] && echo 1 > /sys/kernel/srgn_splash/release
+    # 收掉 U-Boot splash：DRM 可能仍在异步 probe，最多等 5 秒再启动应用。
+    # release 会先停 DEBE layer，等待扫描排空，再把保留显存还给 buddy。
+    if ls /proc/device-tree/reserved-memory/splash-fb@*/compatible > /dev/null 2>&1; then
+        splash_wait=0
+        while [ ! -w /sys/kernel/srgn_splash/release ] && [ "$splash_wait" -lt 100 ]; do
+            sleep 0.05
+            splash_wait=$((splash_wait + 1))
+        done
+        if [ -w /sys/kernel/srgn_splash/release ]; then
+            echo 1 > /sys/kernel/srgn_splash/release
+        else
+            log "splash handover release interface timed out"
+        fi
+    fi
 
     while true; do
         chmod +x "$APP" 2> /dev/null

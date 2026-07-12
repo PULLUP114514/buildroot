@@ -30,7 +30,7 @@ diff -Naur a/board/sunxi/Makefile b/board/sunxi/Makefile
 diff -Naur a/board/sunxi/srgn_splash.c b/board/sunxi/srgn_splash.c
 --- a/board/sunxi/srgn_splash.c	1970-01-01 08:00:00.000000000 +0800
 +++ b/board/sunxi/srgn_splash.c	2026-07-05 22:57:26.851999879 +0800
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,368 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * srgn_splash - minimal DEBE + TCON0 bring-up for suniv (F1C100s/200s)
@@ -62,6 +62,7 @@ diff -Naur a/board/sunxi/srgn_splash.c b/board/sunxi/srgn_splash.c
 +#include <asm/arch/display.h>
 +#include <asm/arch/gpio.h>
 +#include <asm/arch/lcdc.h>
++#include <asm/arch/pwm.h>
 +
 +/* same encoding as kernel SUN4I_BACKEND_LAY_FBFMT_RGB565 */
 +#define SRGN_DE_BE_LAYER_ATTR1_FMT_RGB565	(0x05 << 8)
@@ -223,15 +224,20 @@ diff -Naur a/board/sunxi/srgn_splash.c b/board/sunxi/srgn_splash.c
 +}
 +
 +/*
-+ * pwm-backlight on PWM0/PE12, normal polarity: drive the pad high as
-+ * plain GPIO for full brightness; the kernel re-muxes it to PWM later.
++ * Leave PWM0 running at 24 MHz / 240 = 100 kHz and 100% duty.  Linux
++ * pwm-sun4i can read this enabled state and change to the DT brightness
++ * without the GPIO-to-PWM handover turning the backlight off.
 + */
 +static void srgn_backlight_on(void)
 +{
-+	struct sunxi_gpio *pio = BANK_TO_GPIO(GPIO_BANK(SUNXI_GPE(12)));
++	struct sunxi_pwm * const pwm = (struct sunxi_pwm *)SUNXI_PWM_BASE;
 +
-+	setbits_le32(&pio->dat, 1U << GPIO_NUM(SUNXI_GPE(12)));
-+	sunxi_gpio_set_cfgpin(SUNXI_GPE(12), SUNXI_GPIO_OUTPUT);
++	writel(SUNXI_PWM_CH0_PERIOD_PRD(239) |
++	       SUNXI_PWM_CH0_PERIOD_DUTY(240), &pwm->ch0_period);
++	writel(SUNXI_PWM_CTRL_PRESCALE0(0xf) |
++	       SUNXI_PWM_CTRL_CH0_ACT_STA |
++	       SUNXI_PWM_CTRL_ENABLE0, &pwm->ctrl);
++	sunxi_gpio_set_cfgpin(SUNXI_GPE(12), SUNXI_PWM_MUX);
 +}
 +
 +/*
@@ -257,15 +263,7 @@ diff -Naur a/board/sunxi/srgn_splash.c b/board/sunxi/srgn_splash.c
 +	};
 +	char name[32];
 +	fdt32_t reg[2];
-+	int i, node, resv;
-+
-+	for (i = 0; i < ARRAY_SIZE(live_compats); i++) {
-+		node = fdt_node_offset_by_compatible(blob, -1, live_compats[i]);
-+		if (node < 0 ||
-+		    fdt_setprop_empty(blob, node, "srgn,live-scanout"))
-+			printf("srgn: warn: no live-scanout mark on %s\n",
-+			       live_compats[i]);
-+	}
++	int i, node = -1, resv;
 +
 +	resv = fdt_path_offset(blob, "/reserved-memory");
 +	if (resv < 0) {
@@ -284,12 +282,57 @@ diff -Naur a/board/sunxi/srgn_splash.c b/board/sunxi/srgn_splash.c
 +		goto fail;
 +	reg[0] = cpu_to_fdt32(fb);
 +	reg[1] = cpu_to_fdt32(ALIGN(size, 4096));
-+	if (fdt_setprop(blob, node, "reg", reg, sizeof(reg)))
++	if (fdt_setprop_string(blob, node, "compatible",
++			       "srgn,splash-framebuffer") ||
++	    fdt_setprop(blob, node, "reg", reg, sizeof(reg)))
 +		goto fail;
 +
-+	env_set("splash_active", "1");
++	/*
++	 * Publish live-scanout only after the framebuffer reservation exists.
++	 * Otherwise a partial FDT edit would make Linux preserve DMA from
++	 * pages that its allocator is free to overwrite.
++	 */
++	for (i = 0; i < ARRAY_SIZE(live_compats); i++) {
++		int live;
++
++		live = fdt_node_offset_by_compatible(blob, -1,
++						     live_compats[i]);
++		if (live < 0 ||
++		    fdt_setprop_empty(blob, live, "srgn,live-scanout")) {
++			printf("srgn: warn: no live-scanout mark on %s\n",
++			       live_compats[i]);
++			goto rollback;
++		}
++
++		/*
++		 * The base DT assigns CLK_TCON to 297 MHz.  Linux applies that
++		 * assignment before the TCON driver's probe, which changes the
++		 * live dot clock from pll3 / 6 (24 MHz) to 49.5 MHz.  Preserve
++		 * the exact pll3 rate selected above for this panel.
++		 */
++		if (!i &&
++		    fdt_setprop_u32(blob, live, "assigned-clock-rates",
++				    clock_get_pll3())) {
++			printf("srgn: warn: cannot preserve live TCON clock\n");
++			goto rollback;
++		}
++	}
++
++	if (env_set("splash_active", "1"))
++		goto rollback;
 +	return;
++rollback:
++	for (i = 0; i < ARRAY_SIZE(live_compats); i++) {
++		int live;
++
++		live = fdt_node_offset_by_compatible(blob, -1,
++						     live_compats[i]);
++		if (live >= 0)
++			fdt_delprop(blob, live, "srgn,live-scanout");
++	}
 +fail:
++	if (node >= 0)
++		fdt_del_node(blob, node);
 +	printf("srgn: warn: could not reserve splash fb in fdt\n");
 +}
 +
