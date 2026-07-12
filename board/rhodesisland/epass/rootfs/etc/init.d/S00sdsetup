@@ -67,9 +67,11 @@ fi
 
 # share 分区: 先修正 MBR 里的大小,
 # 再在没有文件系统时格成 FAT(busybox mkfs.vfat 按大小自动选 FAT16/32)
+# 注意: 未开 CONFIG_FEATURE_BLKID_TYPE 时 busybox blkid 不打印 TYPE=,
+# 但仍会打印 LABEL=/UUID=,不能只靠 TYPE= 判断
 if [ -b "$SHARE_DEV" ]; then
     fix_share_size
-    if ! blkid "$SHARE_DEV" | grep -q 'TYPE='; then
+    if ! blkid "$SHARE_DEV" 2> /dev/null | grep -qE 'TYPE=|UUID=|LABEL='; then
         log "formatting $SHARE_DEV as FAT"
         mkfs.vfat -n SHARE "$SHARE_DEV" > /dev/null 2>&1 || log "mkfs.vfat $SHARE_DEV failed"
     fi

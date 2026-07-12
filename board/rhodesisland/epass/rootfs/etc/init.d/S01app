@@ -14,6 +14,8 @@
 APP_DIR=/root
 PIDFILE=/var/run/epass_app.pid
 SYSTEM_MAINTENANCE=/app/system_maintenance/system_maintenance
+QUICK_START=/app/quick_start/quick_start
+QUICK_START_DONE=/etc/.quick_start_done
 
 log() {
     echo "epass_app: $*" > /dev/kmsg
@@ -80,6 +82,18 @@ supervise() {
         fi
     fi
 
+    # 首次开机：SD 已挂载、splash 已释放，再跑 quick_start，之后才进主 app
+    if [ ! -f "$QUICK_START_DONE" ]; then
+        if [ -x "$QUICK_START" ]; then
+            log "first boot: starting $QUICK_START"
+            "$QUICK_START"
+            log "quick_start finished (exit $?)"
+        else
+            log "first boot: $QUICK_START missing, skip"
+        fi
+        touch "$QUICK_START_DONE"
+    fi
+
     while true; do
         chmod +x "$APP" 2> /dev/null
         log "starting $APP"
@@ -133,7 +147,7 @@ case "$1" in
     stop)
         [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2> /dev/null
         rm -f "$PIDFILE"
-        killall app_360 app_720 system_maintenance 2> /dev/null
+        killall app_360 app_720 system_maintenance quick_start 2> /dev/null
         ;;
     restart)
         "$0" stop

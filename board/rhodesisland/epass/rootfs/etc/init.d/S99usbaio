@@ -2,23 +2,32 @@
 #
 # epass USB gadget all-in-one handler
 #
-# 从 S00app 独立出来：延迟一段时间再拉起 usb_aio_handler，
+# 从 S00app 独立出来：等主 app 起来后再拉起 usb_aio_handler，
 # 避免 USB gadget 枚举跟主程序启动争抢显示/存储资源。
 
 PIDFILE=/var/run/usb_aio.pid
-START_DELAY=5
+POST_APP_DELAY=3
 
 log() {
     echo "usb_aio: $*" > /dev/kmsg
 }
 
+# 等待 app_360 或 app_720 任一进程出现
+wait_for_app() {
+    while ! pidof app_360 > /dev/null 2>&1 && ! pidof app_720 > /dev/null 2>&1; do
+        sleep 1
+    done
+}
+
 start() {
     # USB gadget 总管：greeter 枚举 -> 屏上选功能 -> 重枚举
     command -v usb_aio_handler > /dev/null || exit 0
-    # 后台延迟启动，等主程序先抢占完资源
+    # 后台等待主 app 启动后再延迟拉起
     (
-        sleep "$START_DELAY"
-        log "starting usb_aio_handler (after ${START_DELAY}s)"
+        log "waiting for app_360 or app_720"
+        wait_for_app
+        sleep "$POST_APP_DELAY"
+        log "starting usb_aio_handler (app up + ${POST_APP_DELAY}s)"
         start-stop-daemon -S -q -m -b -p "$PIDFILE" -x "$(command -v usb_aio_handler)"
     ) &
 }

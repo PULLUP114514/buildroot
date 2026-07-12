@@ -5,7 +5,7 @@
 ################################################################################
 
 
-EPASSCTL_VERSION = 07b96b87d8b24b4c88ae69c9c1c058bafbde2631
+EPASSCTL_VERSION = 6da759f72c5b2f33d92377db350e8a9b4074f664
 EPASSCTL_SITE = https://github.com/rhodesepass/epassctl.git
 EPASSCTL_SITE_METHOD = git
 EPASSCTL_DEPENDENCIES = 

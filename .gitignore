@@ -18,3 +18,5 @@
 /.bootenv.txt
 /.bootinfo.txt
 
+
+local.mk

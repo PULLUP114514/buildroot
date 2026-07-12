@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-EPASS_APPLICATIONS_VERSION = b9faf814d357c9940e38805c94210bbbf3b60ac1
+EPASS_APPLICATIONS_VERSION = 813cf11f09c95442f159940cc8ccde3516892c51
 EPASS_APPLICATIONS_SITE = https://github.com/rhodesepass/epass-applications.git
 EPASS_APPLICATIONS_SITE_METHOD = git
 EPASS_APPLICATIONS_GIT_SUBMODULES = YES
