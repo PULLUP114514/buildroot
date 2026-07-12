@@ -128,6 +128,9 @@
 			interrupts = <10>;
 			clocks = <&ccu CLK_BUS_SPI0>, <&ccu CLK_BUS_SPI0>;
 			clock-names = "ahb", "mod";
+			dmas = <&dma SUN4I_DMA_NORMAL 4>,
+			       <&dma SUN4I_DMA_NORMAL 4>;
+			dma-names = "rx", "tx";
 			resets = <&ccu RST_BUS_SPI0>;
 			status = "disabled";
 			pinctrl-names = "default";
@@ -143,6 +146,9 @@
 			interrupts = <11>;
 			clocks = <&ccu CLK_BUS_SPI1>, <&ccu CLK_BUS_SPI1>;
 			clock-names = "ahb", "mod";
+			dmas = <&dma SUN4I_DMA_NORMAL 5>,
+			       <&dma SUN4I_DMA_NORMAL 5>;
+			dma-names = "rx", "tx";
 			resets = <&ccu RST_BUS_SPI1>;
 			status = "disabled";
 			#address-cells = <1>;

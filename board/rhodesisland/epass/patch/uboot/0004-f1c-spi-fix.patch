@@ -145,3 +145,18 @@ index d7de4539..f0157017 100644
  };
  
  static const struct udevice_id sun4i_spi_ids[] = {
+
+diff --git a/arch/arm/mach-sunxi/spl_spi_sunxi.c b/arch/arm/mach-sunxi/spl_spi_sunxi.c
+--- a/arch/arm/mach-sunxi/spl_spi_sunxi.c
++++ b/arch/arm/mach-sunxi/spl_spi_sunxi.c
+@@ -171,3 +171,7 @@ static void spi0_enable_clock(void)
+-	/* Divide by 32, clock source is AHB clock 200MHz */
+-	writel(SPI0_CLK_DIV_BY_32, base + (is_sun6i_gen_spi() ?
+-				  SUN6I_SPI0_CCTL : SUN4I_SPI0_CCTL));
++	/*
++	 * suniv feeds the SPI divider directly from the 200 MHz AHB clock.
++	 * Divide by 4 to run SPL SPI at 50 MHz, matching the effective rate
++	 * selected by the full U-Boot driver for an 80 MHz request.
++	 */
++	writel(SPI0_CLK_DIV_BY_4, base + (is_sun6i_gen_spi() ?
++				 SUN6I_SPI0_CCTL : SUN4I_SPI0_CCTL));
