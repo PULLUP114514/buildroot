@@ -211,6 +211,15 @@ ifeq ($(BR2_PACKAGE_GDB_SERVER),y)
 GDB_POST_INSTALL_TARGET_HOOKS += GDB_SDK_INSTALL_GDBSERVER
 endif
 
+# gdb 8.2.1 bundles an old readline (and other code) written in pre-C23 style:
+# K&R empty-parameter-list typedefs (which C23 reinterprets as "(void)", making
+# calls with arguments a hard error), old-style definitions, implicit wcwidth()
+# declarations and incompatible function pointers. GCC 15 defaults to -std=gnu23
+# and turns several of these into hard errors that --disable-werror can't relax.
+# Build with the pre-C23 dialect and downgrade the remaining default errors.
+HOST_GDB_CONF_ENV += \
+	CFLAGS="$(HOST_CFLAGS) -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=return-mismatch"
+
 # A few notes:
 #  * --target, because we're doing a cross build rather than a real
 #    host build.
