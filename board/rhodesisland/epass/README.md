@@ -16,7 +16,10 @@ of the boot partition as bad-block reserve. If DFU skips bad blocks before the
 kernel FIT, its physical start moves by whole eraseblocks; U-Boot scans from
 the nominal offset to find it.
 
-if you want to change the partition layout, you need to change the mtdparts in uboot.defconfig and devicetree/linux/base/epass.dtsi and uboot.env.
+Partitions come from fixed-partitions in both
+devicetree/linux/base/epass.dtsi (kernel) and
+devicetree/uboot/suniv-f1c100s-generic.dts (U-Boot / DFU). Keep those two in
+sync when changing the layout.
 
 # ePass SD Card
 

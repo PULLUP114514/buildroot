@@ -39,14 +39,8 @@ def xfel_boot():
 
 def flash_nand(rev, screen, files):
     env_payload = (
-        "bootargs=console=ttyS0,115200 panic=5 rootwait "
-        "mtdparts=spi0.0:896K(u-boot)ro,128K(bootenv),6M(boot),-(rootfs) "
-        "root=ubi0:rootfs rw rootfstype=ubifs ubi.mtd=3 "
-        "ubi.fm_autoconvert=1\n"
         f"device_rev={rev}\n"
         f"screen={screen}\n"
-        "interface=\n"
-        "ext=\n"
     ).encode("utf-8") + b"\x00"
 
     make_bootinfo(env_payload, 0x01)
@@ -81,12 +75,8 @@ def flash_nand(rev, screen, files):
 
 def flash_sd(rev, screen, files):
     env_payload = (
-        "bootargs=console=ttyS0,115200 panic=5 rootwait "
-        "root=/dev/mmcblk0p2 rw rootfstype=ext4\n"
         f"device_rev={rev}\n"
         f"screen={screen}\n"
-        "interface=\n"
-        "ext=\n"
     ).encode("utf-8") + b"\x00"
 
     make_bootinfo(env_payload, 0x02)
@@ -120,22 +110,22 @@ def flash_sd(rev, screen, files):
 
 
 if __name__ == "__main__":
-    # flash_nand(
+    flash_nand(
+        "0.6",
+        "hsd",
+        {
+            "uboot": "output/images/u-boot-sunxi-with-nand-spl.bin",
+            "boot": "output/images/boot.itb",
+            "rootfs": "output/images/rootfs_ubi.img",
+        },
+    )
+
+    # flash_sd(
     #     "0.3",
     #     "hsd",
     #     {
-    #         "uboot": "output/images/u-boot-sunxi-with-nand-spl.bin",
-    #         "boot": "output/images/boot.itb",
-    #         "rootfs": "output/images/rootfs_ubi.img",
+    #         "uboot": "output/images/u-boot-sunxi-with-spl.bin",
+    #         "boot": "output/images/bootfs.vfat",
+    #         "rootfs": "output/images/rootfs.ext4",
     #     },
     # )
-
-    flash_sd(
-        "0.3",
-        "hsd",
-        {
-            "uboot": "output/images/u-boot-sunxi-with-spl.bin",
-            "boot": "output/images/bootfs.vfat",
-            "rootfs": "output/images/rootfs.ext4",
-        },
-    )

@@ -62,13 +62,11 @@ dd if=/dev/zero of=bootfs.vfat bs=1M count=8 status=none
 
 # 默认 env.txt 是给直接 dd 烧卡的用户准备的(没有 xfel 写 env 的机会),
 # 可 dd 后在 PC 上挂载 boot 分区改 device_rev/screen。
+# bootargs 由 uboot.env 的 ensurecmdline_sd 提供; interface/ext/extracmd 可选, 空则跳过。
 # xfel+DFU 流程里 sdflash 的 fatwrite 会用实际值覆盖它。
 cat > env.txt << 'EOF'
-bootargs=console=ttyS0,115200 panic=5 rootwait root=/dev/mmcblk0p2 rw rootfstype=ext4
 device_rev=0.6
 screen=hsd
-interface=
-ext=
 EOF
 "${HOST_DIR}/bin/mcopy" -i bootfs.vfat env.txt ::env.txt
 
@@ -83,6 +81,7 @@ otherwise the device may boot with a wrong device tree / screen driver.
   screen      panel type: hsd / boe / laowu / hsd_nv3052
   interface   optional interface overlays (space separated), e.g. i2c0 uart1
   ext         optional extension overlays, e.g. cardkb es8311_sound
+  extracmd    optional extra kernel cmdline (appended last)
 
 重要: env.txt 默认 device_rev=0.6, screen=hsd。
 如果与你的硬件不符, 请在首次开机前修改 env.txt,
