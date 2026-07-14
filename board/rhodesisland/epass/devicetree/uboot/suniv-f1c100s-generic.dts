@@ -43,6 +43,33 @@
 		reg = <0>;
 		compatible = "spi-nand";
 		spi-max-frequency = <80000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x000000 0x0e0000>;
+				read-only;
+			};
+
+			partition@e0000 {
+				label = "bootenv";
+				reg = <0x0e0000 0x020000>;
+			};
+
+			partition@100000 {
+				label = "boot";
+				reg = <0x100000 0x600000>;
+			};
+
+			partition@700000 {
+				label = "rootfs";
+				reg = <0x700000 0x7900000>;
+			};
+		};
 	};
 };
 

@@ -1,0 +1,314 @@
+Backport MTD fixed-partitions parsing from DT and use it in DFU.
+
+U-Boot 2020.07 only supports mtdparts/mtdids for partitioning. Pull in
+add_mtd_partitions_of() (upstream v2021.07, commit dc339bf784f0) so
+SPI-NAND partitions can live in the board DTS, and teach DFU to resolve
+part/partubi from mtd->partitions like upstream does since v2022.01.
+
+--- a/drivers/core/ofnode.c
++++ b/drivers/core/ofnode.c
+@@ -286,7 +286,8 @@
+ 	return node;
+ }
+ 
+-fdt_addr_t ofnode_get_addr_size_index(ofnode node, int index, fdt_size_t *size)
++static fdt_addr_t __ofnode_get_addr_size_index(ofnode node, int index,
++					       fdt_size_t *size, bool translate)
+ {
+ 	int na, ns;
+ 
+@@ -304,7 +305,7 @@
+ 
+ 		ns = of_n_size_cells(ofnode_to_np(node));
+ 
+-		if (IS_ENABLED(CONFIG_OF_TRANSLATE) && ns > 0) {
++		if (translate && IS_ENABLED(CONFIG_OF_TRANSLATE) && ns > 0) {
+ 			return of_translate_address(ofnode_to_np(node), prop_val);
+ 		} else {
+ 			na = of_n_addr_cells(ofnode_to_np(node));
+@@ -315,12 +316,24 @@
+ 		ns = ofnode_read_simple_size_cells(ofnode_get_parent(node));
+ 		return fdtdec_get_addr_size_fixed(gd->fdt_blob,
+ 						  ofnode_to_offset(node), "reg",
+-						  index, na, ns, size, true);
++						  index, na, ns, size,
++						  translate);
+ 	}
+ 
+ 	return FDT_ADDR_T_NONE;
+ }
+ 
++fdt_addr_t ofnode_get_addr_size_index(ofnode node, int index, fdt_size_t *size)
++{
++	return __ofnode_get_addr_size_index(node, index, size, true);
++}
++
++fdt_addr_t ofnode_get_addr_size_index_notrans(ofnode node, int index,
++					      fdt_size_t *size)
++{
++	return __ofnode_get_addr_size_index(node, index, size, false);
++}
++
+ fdt_addr_t ofnode_get_addr_index(ofnode node, int index)
+ {
+ 	fdt_size_t size;
+--- a/include/dm/ofnode.h
++++ b/include/dm/ofnode.h
+@@ -430,6 +430,19 @@
+ 				       fdt_size_t *size);
+ 
+ /**
++ * ofnode_get_addr_size_index_notrans() - get an address/size from a node
++ *					  based on index, without address
++ *					  translation through "ranges"
++ *
++ * @node: node to read from
++ * @index: Index of address to read (0 for first)
++ * @size: Pointer to size of the address
++ * @return address, or FDT_ADDR_T_NONE if not present or invalid
++ */
++phys_addr_t ofnode_get_addr_size_index_notrans(ofnode node, int index,
++					       fdt_size_t *size);
++
++/**
+  * ofnode_get_addr_index() - get an address from a node
+  *
+  * This reads the register address from a node
+--- a/include/linux/mtd/mtd.h
++++ b/include/linux/mtd/mtd.h
+@@ -342,6 +342,11 @@
+ {
+ 	return mtd->dev->node.np;
+ }
++
++static inline ofnode mtd_get_ofnode(struct mtd_info *mtd)
++{
++	return mtd->dev->node;
++}
+ #else
+ struct device_node;
+ 
+@@ -580,6 +585,15 @@
+ {
+ 	return 0;
+ }
++#endif
++
++#if defined(CONFIG_MTD_PARTITIONS) && CONFIG_IS_ENABLED(DM) &&     CONFIG_IS_ENABLED(OF_CONTROL)
++int add_mtd_partitions_of(struct mtd_info *master);
++#else
++static inline int add_mtd_partitions_of(struct mtd_info *master)
++{
++	return 0;
++}
+ #endif
+ 
+ struct mtd_info *__mtd_next_device(int i);
+--- a/drivers/mtd/mtdpart.c
++++ b/drivers/mtd/mtdpart.c
+@@ -30,6 +30,9 @@
+ #include <linux/mtd/partitions.h>
+ #include <linux/err.h>
+ #include <linux/sizes.h>
++#if CONFIG_IS_ENABLED(DM) && CONFIG_IS_ENABLED(OF_CONTROL)
++#include <dm/ofnode.h>
++#endif
+ 
+ #include "mtdcore.h"
+ 
+@@ -892,6 +895,72 @@
+ 	return 0;
+ }
+ 
++#if CONFIG_IS_ENABLED(DM) && CONFIG_IS_ENABLED(OF_CONTROL)
++/**
++ * add_mtd_partitions_of - Create MTD partitions from DT fixed-partitions
++ */
++int add_mtd_partitions_of(struct mtd_info *master)
++{
++	ofnode parts, child;
++	int i = 0;
++
++	if (!master->dev)
++		return 0;
++
++	parts = ofnode_find_subnode(mtd_get_ofnode(master), "partitions");
++	if (!ofnode_valid(parts) || !ofnode_is_available(parts) ||
++	    !ofnode_device_is_compatible(parts, "fixed-partitions"))
++		return 0;
++
++	ofnode_for_each_subnode(child, parts) {
++		struct mtd_partition part = { 0 };
++		struct mtd_info *slave;
++		fdt_addr_t offset, size;
++
++		if (!ofnode_is_available(child))
++			continue;
++
++		offset = ofnode_get_addr_size_index_notrans(child, 0, &size);
++		if (offset == FDT_ADDR_T_NONE || !size) {
++			debug("Missing partition offset/size on \"%s\" partition\n",
++			      master->name);
++			continue;
++		}
++
++		part.name = ofnode_read_string(child, "label");
++		if (!part.name)
++			part.name = ofnode_read_string(child, "name");
++
++		/*
++		 * .mask_flags is used to remove flags in allocate_partition(),
++		 * so when "read-only" is present, we add MTD_WRITEABLE to the
++		 * mask, and so MTD_WRITEABLE will be removed on partition
++		 * allocation.
++		 */
++		if (ofnode_read_bool(child, "read-only"))
++			part.mask_flags |= MTD_WRITEABLE;
++		if (ofnode_read_bool(child, "lock"))
++			part.mask_flags |= MTD_POWERUP_LOCK;
++
++		part.offset = offset;
++		part.size = size;
++		part.ecclayout = master->ecclayout;
++
++		slave = allocate_partition(master, &part, i++, 0);
++		if (IS_ERR(slave))
++			return PTR_ERR(slave);
++
++		mutex_lock(&mtd_partitions_mutex);
++		list_add_tail(&slave->node, &master->partitions);
++		mutex_unlock(&mtd_partitions_mutex);
++
++		add_mtd_device(slave);
++	}
++
++	return 0;
++}
++#endif /* CONFIG_IS_ENABLED(DM) && CONFIG_IS_ENABLED(OF_CONTROL) */
++
+ #ifndef __UBOOT__
+ static DEFINE_SPINLOCK(part_parser_lock);
+ static LIST_HEAD(part_parsers);
+--- a/drivers/mtd/mtd_uboot.c
++++ b/drivers/mtd/mtd_uboot.c
+@@ -213,13 +213,21 @@
+ 	 * or if our previous attempt to delete existing partititions failed.
+ 	 * In any of these cases we want to update the partitions, otherwise,
+ 	 * everything is up-to-date and we can return 0 directly.
++	 *
++	 * Also re-run when the device list was updated so OF fixed-partitions
++	 * can be applied even when mtdparts/mtdids are unset.
+ 	 */
+-	if ((!mtdparts && !old_mtdparts && !mtdids && !old_mtdids) ||
+-	    (mtdparts && old_mtdparts && mtdids && old_mtdids &&
+-	     !mtd_dev_list_updated() && !mtd_del_all_parts_failed &&
+-	     !strcmp(mtdparts, old_mtdparts) &&
+-	     !strcmp(mtdids, old_mtdids)))
+-		return 0;
++	{
++		bool updated = mtd_dev_list_updated();
++
++		if ((!mtdparts && !old_mtdparts && !mtdids && !old_mtdids &&
++		     !updated && !mtd_del_all_parts_failed) ||
++		    (mtdparts && old_mtdparts && mtdids && old_mtdids &&
++		     !updated && !mtd_del_all_parts_failed &&
++		     !strcmp(mtdparts, old_mtdparts) &&
++		     !strcmp(mtdids, old_mtdids)))
++			return 0;
++	}
+ 
+ 	/* Update the local copy of mtdparts */
+ 	free(old_mtdparts);
+@@ -240,9 +248,9 @@
+ 	 */
+ 	mtd_dev_list_updated();
+ 
+-	/* If either mtdparts or mtdids is empty, then exit */
++	/* Parse cmdline partitions only when both mtdparts and mtdids exist */
+ 	if (!mtdparts || !mtdids)
+-		return 0;
++		goto of_fallback;
+ 
+ 	/* Start the parsing by ignoring the extra 'mtdparts=' prefix, if any */
+ 	if (!strncmp(mtdparts, "mtdparts=", sizeof("mtdparts=") - 1))
+@@ -342,6 +350,16 @@
+ 		put_mtd_device(mtd);
+ 	}
+ 
++of_fallback:
++	/* Fallback to OF fixed-partitions when a device has none yet */
++	mtd_for_each_device(mtd) {
++		if (list_empty(&mtd->partitions)) {
++			if (add_mtd_partitions_of(mtd) < 0)
++				printf("Failed parsing MTD %s OF partitions!\n",
++				       mtd->name);
++		}
++	}
++
+ 	/*
+ 	 * Call mtd_dev_list_updated() to clear updates generated by our own
+ 	 * parts registration loop.
+--- a/drivers/dfu/dfu_mtd.c
++++ b/drivers/dfu/dfu_mtd.c
+@@ -11,7 +11,6 @@
+ #include <dfu.h>
+ #include <malloc.h>
+ #include <mtd.h>
+-#include <jffs2/load_kernel.h>
+ #include <linux/err.h>
+ 
+ static bool mtd_is_aligned_with_block_size(struct mtd_info *mtd, u64 size)
+@@ -355,7 +354,7 @@
+ 	char *st;
+ 	struct mtd_info *mtd;
+ 	bool has_pages;
+-	int ret, part;
++	int part;
+ 
+ 	mtd = get_mtd_device_nm(devstr);
+ 	if (IS_ERR_OR_NULL(mtd))
+@@ -375,28 +374,31 @@
+ 		s++;
+ 		dfu->data.mtd.size = simple_strtoul(s, &s, 16);
+ 	} else if ((!strcmp(st, "part")) || (!strcmp(st, "partubi"))) {
+-		char mtd_id[32];
+-		struct mtd_device *mtd_dev;
+-		u8 part_num;
+-		struct part_info *pi;
++		struct mtd_info *partition;
++		int partnum = 0;
++		bool part_found = false;
+ 
+ 		dfu->layout = DFU_RAW_ADDR;
+ 
+ 		part = simple_strtoul(s, &s, 10);
+ 
+-		sprintf(mtd_id, "%s,%d", devstr, part - 1);
+-		printf("using id '%s'\n", mtd_id);
++		/* Register partitions from mtdparts or DT fixed-partitions */
++		mtd_probe_devices();
+ 
+-		mtdparts_init();
+-
+-		ret = find_dev_and_part(mtd_id, &mtd_dev, &part_num, &pi);
+-		if (ret != 0) {
+-			printf("Could not locate '%s'\n", mtd_id);
++		list_for_each_entry(partition, &mtd->partitions, node) {
++			partnum++;
++			if (partnum == part) {
++				part_found = true;
++				break;
++			}
++		}
++		if (!part_found) {
++			printf("No partition %d in %s\n", part, mtd->name);
+ 			return -1;
+ 		}
+ 
+-		dfu->data.mtd.start = pi->offset;
+-		dfu->data.mtd.size = pi->size;
++		dfu->data.mtd.start = partition->offset;
++		dfu->data.mtd.size = partition->size;
+ 		if (!strcmp(st, "partubi"))
+ 			dfu->data.mtd.ubi = 1;
+ 	} else {
