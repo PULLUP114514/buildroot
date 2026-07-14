@@ -1,0 +1,45 @@
+cedrus: bind DT memory-region as dedicated CMA pool
+
+Mainline cedrus never calls of_reserved_mem_device_init(), so a
+memory-region property in the VE node is silently ignored and all
+buffers come from the global CMA area. Bind it in probe so the
+16M reusable pool in the board dts actually isolates decode buffers
+from other CMA users (framebuffer etc.) on the 32M variant.
+
+Called after cedrus_hw_probe() so an -EPROBE_DEFER from clock/reset
+acquisition never leaves a stale binding behind. -ENODEV means no
+memory-region property: fall back to global CMA, not an error.
+
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -16,6 +16,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_reserved_mem.h>
+ 
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ioctl.h>
+@@ -333,6 +334,13 @@
+ 		return ret;
+ 	}
+ 
++	/* optional dedicated CMA pool; fall back to global CMA when absent */
++	ret = of_reserved_mem_device_init(&pdev->dev);
++	if (ret && ret != -ENODEV) {
++		dev_err(&pdev->dev, "Failed to bind reserved memory\n");
++		return ret;
++	}
++
+ 	dev->dec_ops[CEDRUS_CODEC_MPEG2] = &cedrus_dec_ops_mpeg2;
+ 	dev->dec_ops[CEDRUS_CODEC_H264] = &cedrus_dec_ops_h264;
+ 
+@@ -424,6 +432,8 @@
+ 
+ 	cedrus_hw_remove(dev);
+ 
++	of_reserved_mem_device_release(&pdev->dev);
++
+ 	return 0;
+ }
+ 

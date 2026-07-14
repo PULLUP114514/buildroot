@@ -1,0 +1,32 @@
+#!/bin/sh
+#
+# zram swap,按实际内存分档(32M/64M 机型)。
+# disksize 是解压后的容量上限,不是 RAM 占用;
+# 按 lzo ~3:1 压缩率,满载时 RAM 成本约 disksize/3。
+
+case "$1" in
+    start | restart | reload) ;;
+    stop)
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+[ -e /sys/block/zram0/disksize ] || exit 0
+
+mem=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+if [ "$mem" -lt 45000 ]; then
+    size=8M
+else
+    size=16M
+fi
+
+echo lzo > /sys/block/zram0/comp_algorithm 2> /dev/null
+echo $size > /sys/block/zram0/disksize || exit 0
+mkswap /dev/zram0 > /dev/null 2>&1 && swapon /dev/zram0
+
+# 唯一的 swap 是压缩内存,换出便宜,倾向积极换出冷页
+echo 100 > /proc/sys/vm/swappiness

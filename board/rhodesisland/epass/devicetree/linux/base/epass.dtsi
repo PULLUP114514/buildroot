@@ -62,16 +62,19 @@
 		default-brightness-level = <6>;
 	};
 
-	// reserved-memory {
-    //       #address-cells = <1>;
-    //       #size-cells = <1>;
-    //       ranges;
-	// 	  cedar_reserved: cedar_reserved@80100000 {
-	// 			compatible = "shared-dma-pool";
-	// 			reg = <0x80100000 0xc0000>;
-	// 			no-map;
-	// 		};
-	// };
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		// VE dedicated CMA pool: can be borrowed by page cache/anonymous pages when idle, and reclaimed by the driver when decoding.
+		cedar_reserved: cedar-pool {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x1000000>;
+			alignment = <0x400000>;
+		};
+	};
 
 	st7701initseq: st7701initseq {
 		compatible = "lattland,st7701-initseq";
@@ -214,6 +217,7 @@
 };
 
 &cedar_ve {
+	memory-region = <&cedar_reserved>;
 	status = "okay";
 };
 
