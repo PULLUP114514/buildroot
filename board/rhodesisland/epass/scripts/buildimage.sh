@@ -79,7 +79,7 @@ IMPORTANT: env.txt defaults to device_rev=0.6, screen=hsd.
 If your hardware differs, edit env.txt BEFORE first boot,
 otherwise the device may boot with a wrong device tree / screen driver.
 
-  device_rev  board revision: 0.2 / 0.3 / 0.5 / 0.6
+  device_rev  board revision: 0.1 / 0.2 / 0.3 / 0.5 / 0.6
   screen      panel type: hsd / boe / laowu / hsd_nv3052
   interface   optional interface overlays (space separated), e.g. i2c0 uart1
   ext         optional extension overlays, e.g. cardkb es8311_sound

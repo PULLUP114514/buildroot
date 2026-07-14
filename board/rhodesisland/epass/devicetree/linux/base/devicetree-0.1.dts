@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR X11)
+
+/dts-v1/;
+#include "epass.dtsi"
+
+/ {
+	model = "ArkEPass v0.1";
+};
+
+&st7701initseq {
+	sda-gpios = <&pio 4 3 GPIO_ACTIVE_HIGH>; /* PE3 */
+	scl-gpios = <&pio 3 19 GPIO_ACTIVE_HIGH>; /* PD19 */
+	cs-gpios = <&pio 4 2 GPIO_ACTIVE_HIGH>; /* PE2 */
+};
+
+
+&lradc {
+	button-num-1 {
+		label = "Number_1";
+		linux,code = <KEY_1>;
+		channel = <0>;
+		voltage = <0>;
+	};
+
+	button-num-2 {
+		label = "Number_2";
+		linux,code = <KEY_2>;
+		channel = <0>;
+		voltage = <444444>;
+	};
+
+	button-num-3 {
+		label = "Number_3";
+		linux,code = <KEY_3>;
+		channel = <0>;
+		voltage = <825396>;
+	};
+
+	button-num-4 {
+		label = "Number_4";
+		linux,code = <KEY_4>;
+		channel = <0>;
+		voltage = <1111111>;
+	};
+
+	button-num-5 {
+		label = "Number_5";
+		linux,code = <KEY_5>;
+		channel = <0>;
+		voltage = <1365079>;
+	};
+
+	button-num-6 {
+		label = "Number_6";
+		linux,code = <KEY_6>;
+		channel = <0>;
+		voltage = <1555555>;
+	};
+};
