@@ -10,6 +10,7 @@ config BR2_PACKAGE_EPASS_APPLICATIONS
 	select BR2_PACKAGE_FREETYPE
 	select BR2_PACKAGE_LIBDRM
 	select BR2_PACKAGE_LIBPNG
+	select BR2_PACKAGE_LVGL
 	help
 	  Third-party applications for the Electronic Pass.
 

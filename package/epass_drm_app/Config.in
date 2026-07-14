@@ -1,5 +1,6 @@
 config BR2_PACKAGE_EPASS_DRM_APP
 	bool "epass_drm_app"
+	select BR2_PACKAGE_LVGL
 	help
 	  Electronic Pass main program.
 
