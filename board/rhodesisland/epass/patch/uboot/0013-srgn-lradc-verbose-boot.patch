@@ -1,0 +1,151 @@
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -932,6 +932,15 @@
+ 	  RGB565 framebuffer, so a logo extracted from the boot FIT shows
+ 	  before Linux takes over.
+ 
++config SRGN_LRADC
++	bool "init_sun4i_lradc / chk_verbose_boot for suniv KEYADC"
++	depends on MACH_SUNIV
++	help
++	  Adds init_sun4i_lradc (enable F1C100s LRADC @ 0x01c23400 with a
++	  long settle) and chk_verbose_boot (returns 0 if any key held,
++	  1 otherwise). Env skips quiet when true, e.g.
++	  if chk_verbose_boot; then true; else setenv bootargs "... quiet"; fi
++
+ config SUNXI_DE2
+ 	bool
+ 	default n
+--- a/board/sunxi/Makefile
++++ b/board/sunxi/Makefile
+@@ -14,4 +14,5 @@
+ ifndef CONFIG_SPL_BUILD
+ obj-$(CONFIG_SRGN_ST7701_INIT)	+= srgn_st7701.o
+ obj-$(CONFIG_SRGN_SPLASH)	+= srgn_splash.o
++obj-$(CONFIG_SRGN_LRADC)	+= srgn_lradc.o
+ endif
+--- /dev/null
++++ b/board/sunxi/srgn_lradc.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * suniv LRADC (KEYADC) helpers for hold-to-verbose-boot.
++ *
++ * F1C100s LRADC sits at 0x01c23400 (NOT sun4i SUNXI_LRADC_BASE 0x01c22800).
++ * No clock/reset gate; dedicated non-muxed pin. Register layout matches
++ * Linux drivers/input/keyboard/sun4i-lradc-keys.c.
++ *
++ * Usage from env (console= stays; quiet is the switch):
++ *   init_sun4i_lradc
++ *   ... load / patch / splash ...
++ *   if chk_verbose_boot; then true; else
++ *       setenv bootargs "${bootargs} quiet";
++ *   fi
++ *
++ * chk_verbose_boot returns 0 (true) if any key is held, 1 (false) otherwise.
++ * It does not touch bootargs.
++ *
++ * Rhodes Island Engineering Dept, 1097
++ */
++
++#include <common.h>
++#include <command.h>
++#include <linux/delay.h>
++#include <asm/io.h>
++
++/* suniv / F1C100s KEYADC — see board DT lradc@1c23400 */
++#define SUNIV_LRADC_BASE	0x01c23400
++
++#define LRADC_CTRL		0x00
++#define LRADC_INTC		0x04
++#define LRADC_INTS		0x08
++#define LRADC_DATA0		0x0c
++
++#define FIRST_CONVERT_DLY(x)	((x) << 24)	/* 8 bits, in sample periods */
++#define LEVELA_B_CNT(x)		((x) << 8)	/* 4 bits */
++#define HOLD_EN(x)		((x) << 6)
++#define SAMPLE_RATE(x)		((x) << 2)	/* 0 = 250 Hz (4 ms) */
++#define ENABLE(x)		((x) << 0)
++
++/*
++ * Unpressed ladder sits near full-scale (63). Board keys top out around
++ * ~1.5 V -> raw ~50 with 3 V Vref * 2/3. Anything below this is "held".
++ */
++#define LRADC_PRESSED_MAX	55
++
++/* FIRST_CONVERT_DLY(128) @ 250 Hz ~= 512 ms before first valid sample */
++#define LRADC_INIT_CTRL		(FIRST_CONVERT_DLY(128) | LEVELA_B_CNT(3) | \
++				 HOLD_EN(1) | SAMPLE_RATE(0) | ENABLE(1))
++
++/* Extra wall-clock settle after enabling (on top of FIRST_CONVERT_DLY) */
++#define LRADC_INIT_SETTLE_MS	200
++
++static int lradc_inited;
++
++static int do_init_sun4i_lradc(struct cmd_tbl *cmdtp, int flag, int argc,
++			       char *const argv[])
++{
++	if (argc != 1)
++		return CMD_RET_USAGE;
++
++	/* Clear pending IRQs; we poll DATA0, never use interrupts */
++	writel(0, SUNIV_LRADC_BASE + LRADC_INTC);
++	writel(0x1ff, SUNIV_LRADC_BASE + LRADC_INTS);
++
++	writel(LRADC_INIT_CTRL, SUNIV_LRADC_BASE + LRADC_CTRL);
++	mdelay(LRADC_INIT_SETTLE_MS);
++
++	lradc_inited = 1;
++	printf("lradc: enabled (settle %u ms + first-convert dly 128)\n",
++	       LRADC_INIT_SETTLE_MS);
++
++	return CMD_RET_SUCCESS;
++}
++
++static void lradc_disable(void)
++{
++	writel(FIRST_CONVERT_DLY(2) | LEVELA_B_CNT(1) | HOLD_EN(1) |
++	       SAMPLE_RATE(2), SUNIV_LRADC_BASE + LRADC_CTRL);
++	writel(0, SUNIV_LRADC_BASE + LRADC_INTC);
++	lradc_inited = 0;
++}
++
++static int do_chk_verbose_boot(struct cmd_tbl *cmdtp, int flag, int argc,
++			       char *const argv[])
++{
++	u32 a, b;
++	int pressed;
++
++	if (argc != 1)
++		return CMD_RET_USAGE;
++
++	if (!lradc_inited) {
++		printf("lradc: not inited, run init_sun4i_lradc first\n");
++		return CMD_RET_FAILURE;
++	}
++
++	/* Two samples a sample-period apart; both must look pressed */
++	a = readl(SUNIV_LRADC_BASE + LRADC_DATA0) & 0x3f;
++	mdelay(8);
++	b = readl(SUNIV_LRADC_BASE + LRADC_DATA0) & 0x3f;
++
++	lradc_disable();
++
++	pressed = (a <= LRADC_PRESSED_MAX && b <= LRADC_PRESSED_MAX);
++	printf("lradc: raw=%u,%u pressed=%d\n", a, b, pressed);
++
++	/* 0 = true for `if chk_verbose_boot`, 1 = false */
++	return pressed ? CMD_RET_SUCCESS : CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(
++	init_sun4i_lradc, 1, 0, do_init_sun4i_lradc,
++	"enable suniv LRADC/KEYADC and wait for settle",
++	""
++);
++
++U_BOOT_CMD(
++	chk_verbose_boot, 1, 0, do_chk_verbose_boot,
++	"return 0 if any LRADC key held, 1 otherwise",
++	""
++);
