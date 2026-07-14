@@ -50,7 +50,9 @@ remount_sd() {
     umount /sd > /dev/null 2>&1
     umount "$SD_DEV" > /dev/null 2>&1
     mkdir -p /sd
-    mount -o iocharset=utf8 "$SD_DEV" /sd > /dev/null 2>&1
+    if mount -o iocharset=utf8 "$SD_DEV" /sd > /dev/null 2>&1; then
+        mkdir -p /sd/app /sd/assets
+    fi
 }
 
 supervise() {
