@@ -217,8 +217,20 @@ endif
 # declarations and incompatible function pointers. GCC 15 defaults to -std=gnu23
 # and turns several of these into hard errors that --disable-werror can't relax.
 # Build with the pre-C23 dialect and downgrade the remaining default errors.
+HOST_GDB_CFLAGS = \
+	$(HOST_CFLAGS) \
+	-std=gnu17 \
+	-Wno-error=implicit-function-declaration \
+	-Wno-error=implicit-int \
+	-Wno-error=incompatible-pointer-types \
+	-Wno-error=int-conversion
+
+HOST_GDB_CFLAGS += $(shell printf 'int main(void){return 0;}\n' | \
+	$(HOSTCC_NOCCACHE) -x c - -c -o /dev/null -Werror=return-mismatch >/dev/null 2>&1 && \
+	printf '%s' '-Wno-error=return-mismatch')
+
 HOST_GDB_CONF_ENV += \
-	CFLAGS="$(HOST_CFLAGS) -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=return-mismatch"
+	CFLAGS="$(HOST_GDB_CFLAGS)"
 
 # A few notes:
 #  * --target, because we're doing a cross build rather than a real
