@@ -30,6 +30,7 @@ panel_mode() {
 pick_app() {
     case "$(panel_mode)" in
         lattland,hsd-nv3052) echo "$APP_DIR/app_720" ;;
+        sargon,papyrus)      echo "$APP_DIR/app_720" ;;
         *)                   echo "$APP_DIR/app_360" ;;
     esac
 }

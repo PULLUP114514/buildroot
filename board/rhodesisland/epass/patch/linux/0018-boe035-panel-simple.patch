@@ -1,0 +1,57 @@
+From 22ddb7848d4fb8a523668d6dcba5348b0fe57b04 Mon Sep 17 00:00:00 2001
+From: Wenting Zhang <zephray@outlook.com>
+Date: Mon, 13 Jul 2026 11:18:46 -0400
+Subject: [PATCH] Add mode line for 720p60 panel
+
+---
+ drivers/gpu/drm/panel/panel-simple.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/drivers/gpu/drm/panel/panel-simple.c b/drivers/gpu/drm/panel/panel-simple.c
+index 456533ba2..60b5362ef 100644
+--- a/drivers/gpu/drm/panel/panel-simple.c
++++ b/drivers/gpu/drm/panel/panel-simple.c
+@@ -1465,6 +1465,30 @@ static const struct panel_desc lattland_hsd_nv3052 = {
+ 	.bus_format = MEDIA_BUS_FMT_RGB565_1X16,
+ };
+ 
++static const struct drm_display_mode sargon_papyrus_mode = {
++	.clock = 64000,
++	.hdisplay = 720,
++	.hsync_start = 720 + 45,
++	.hsync_end = 720 + 45 + 4,
++	.htotal = 720 + 45 + 4 + 45,
++	.vdisplay = 1280,
++	.vsync_start = 1280 + 30,
++	.vsync_end = 1280 + 30 + 8,
++	.vtotal = 1280 + 30 + 8 + 20,
++	.vrefresh = 60,
++};
++
++static const struct panel_desc sargon_papyrus = {
++	.modes = &sargon_papyrus_mode,
++	.num_modes = 1,
++	.bpc = 6,
++	.size = {
++		.width = 53,
++		.height = 71,
++	},
++	.bus_format = MEDIA_BUS_FMT_RGB565_1X16,
++};
++
+ static const struct drm_display_mode friendlyarm_hd702e_mode = {
+ 	.clock		= 67185,
+ 	.hdisplay	= 800,
+@@ -3292,6 +3316,9 @@ static const struct of_device_id platform_of_match[] = {
+ 	}, {
+ 		.compatible = "lattland,hsd-nv3052",
+ 		.data = &lattland_hsd_nv3052,
++	}, {
++		.compatible = "sargon,papyrus",
++		.data = &sargon_papyrus,
+ 	}, {
+ 		.compatible = "friendlyarm,hd702e",
+ 		.data = &friendlyarm_hd702e,
+-- 
+2.34.1
+

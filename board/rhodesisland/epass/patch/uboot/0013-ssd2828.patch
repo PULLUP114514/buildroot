@@ -1,0 +1,491 @@
+From f7cdde0cb842ca5fee05ea702539ad210d473de5 Mon Sep 17 00:00:00 2001
+From: Wenting Zhang <zephray@outlook.com>
+Date: Mon, 13 Jul 2026 11:16:54 -0400
+Subject: [PATCH] Enable support for SSD2828 bridged screens and optional
+ LCD_DE pin
+
+---
+ board/sunxi/srgn_splash.c |  18 +-
+ board/sunxi/srgn_st7701.c | 362 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 363 insertions(+), 17 deletions(-)
+
+diff --git a/board/sunxi/srgn_splash.c b/board/sunxi/srgn_splash.c
+index b8d69833..6110f47d 100644
+--- a/board/sunxi/srgn_splash.c
++++ b/board/sunxi/srgn_splash.c
+@@ -42,7 +42,7 @@ struct srgn_timing {
+ };
+ 
+ static int srgn_get_timing(const void *blob, struct srgn_timing *t,
+-			   bool *swap_b_r)
++			   bool *swap_b_r, bool *has_de)
+ {
+ 	const fdt32_t *v;
+ 	int node, len;
+@@ -74,6 +74,8 @@ static int srgn_get_timing(const void *blob, struct srgn_timing *t,
+ 					     "allwinner,suniv-f1c100s-tcon");
+ 	*swap_b_r = node >= 0 &&
+ 		    fdt_getprop(blob, node, "srgn,swap-b-r", NULL);
++	*has_de = node >= 0 &&
++		  fdt_getprop(blob, node, "srgn,has-de", NULL);
+ 	return 0;
+ }
+ 
+@@ -178,9 +180,10 @@ static void srgn_debe_start(void)
+ 
+ /*
+  * Kernel lcd_rgb565_no_de_pins, 19 pads. Do NOT blanket-mux PD0..PD27
+- * like sunxi_display.c: PD19 is the initseq SCL, PD0/PD12 are not LCD.
++ * like sunxi_display.c: PD0/PD12 are not LCD. PD19 is only muxed when
++ * DT says this panel wiring has a real DE line.
+  */
+-static void srgn_lcd_pinmux(void)
++static void srgn_lcd_pinmux(bool has_de)
+ {
+ 	static const u8 pins[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+ 				   13, 14, 15, 16, 17, 18, 20, 21 };
+@@ -188,6 +191,9 @@ static void srgn_lcd_pinmux(void)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(pins); i++)
+ 		sunxi_gpio_set_cfgpin(SUNXI_GPD(pins[i]), SUNXI_GPD_LCD0);
++
++	if (has_de)
++		sunxi_gpio_set_cfgpin(SUNXI_GPD(19), SUNXI_GPD_LCD0);
+ }
+ 
+ /*
+@@ -310,7 +316,7 @@ static int do_srgn_splash(struct cmd_tbl *cmdtp, int flag, int argc,
+ 		(struct sunxi_lcdc_reg *)SUNXI_LCD0_BASE;
+ 	struct srgn_timing t;
+ 	unsigned long dtbaddr, fbaddr;
+-	bool swap_b_r;
++	bool swap_b_r, has_de;
+ 	int div;
+ 
+ 	dtbaddr = argc > 1 ? simple_strtoul(argv[1], NULL, 16) :
+@@ -323,7 +329,7 @@ static int do_srgn_splash(struct cmd_tbl *cmdtp, int flag, int argc,
+ 		return CMD_RET_FAILURE;
+ 	}
+ 
+-	if (srgn_get_timing((void *)dtbaddr, &t, &swap_b_r)) {
++	if (srgn_get_timing((void *)dtbaddr, &t, &swap_b_r, &has_de)) {
+ 		printf("srgn: no srgn,panel-timing, skipping splash\n");
+ 		return 0;
+ 	}
+@@ -342,7 +348,7 @@ static int do_srgn_splash(struct cmd_tbl *cmdtp, int flag, int argc,
+ 
+ 	srgn_de_clocks_on();
+ 	srgn_debe_setup(fbaddr, t.dt.hactive.typ, t.dt.vactive.typ);
+-	srgn_lcd_pinmux();
++	srgn_lcd_pinmux(has_de);
+ 
+ 	lcdc_init(lcdc);
+ 	lcdc_tcon0_mode_set(lcdc, &t.dt, div, false, 16, 0);
+diff --git a/board/sunxi/srgn_st7701.c b/board/sunxi/srgn_st7701.c
+index 94eef19e..09911913 100644
+--- a/board/sunxi/srgn_st7701.c
++++ b/board/sunxi/srgn_st7701.c
+@@ -41,6 +41,52 @@ struct srgn_panel {
+ 	struct srgn_gpio sda, scl, cs, rst;
+ };
+ 
++struct srgn_ssd2828 {
++	struct srgn_gpio sda, scl, cs, rst;
++	u32 pixelclock_khz;
++	u32 xres;
++	u32 hfp;
++	u32 hsync;
++	u32 hbp;
++	u32 yres;
++	u32 vfp;
++	u32 vsync;
++	u32 vbp;
++};
++
++/* SSD2828 register map subset */
++#define SSD2828_VICR1			0xB1
++#define SSD2828_VICR2			0xB2
++#define SSD2828_VICR3			0xB3
++#define SSD2828_VICR4			0xB4
++#define SSD2828_VICR5			0xB5
++#define SSD2828_VICR6			0xB6
++#define SSD2828_CFGR			0xB7
++#define SSD2828_VCR				0xB8
++#define SSD2828_PCR				0xB9
++#define SSD2828_PLCR			0xBA
++#define SSD2828_CCR				0xBB
++#define SSD2828_PSCR1			0xBC
++#define SSD2828_PSCR2			0xBD
++#define SSD2828_PDR				0xBF
++#define SSD2828_LCFR			0xDE
++
++#define SSD2828_VIDEO_PCLK_POL				(1 << 13)
++#define SSD2828_VIDEO_MODE_BURST			(2 << 2)
++#define SSD2828_VIDEO_PIXEL_FORMAT_16BPP	0
++
++#define SSD2828_CFGR_HS			(1 << 0)
++#define SSD2828_CFGR_CKE		(1 << 1)
++#define SSD2828_CFGR_VEN		(1 << 3)
++#define SSD2828_CFGR_DCS		(1 << 6)
++#define SSD2828_CFGR_ECD		(1 << 8)
++#define SSD2828_CFGR_EOT		(1 << 9)
++
++#define SSD2828_TX_CLK_KHZ		24000
++#define SSD2828_DSI_MBPS		350
++#define SSD2828_DSI_LANES		3
++#define SSD2828_LP_CLK_KHZ		10000
++
+ static void srgn_gpio_set(struct srgn_gpio *g, int val)
+ {
+ 	u32 dat;
+@@ -102,6 +148,285 @@ static void srgn_write_9bit(struct srgn_panel *p, int dc, u8 value)
+ #define srgn_write_comm(p, v) srgn_write_9bit(p, 0, v)
+ #define srgn_write_data(p, v) srgn_write_9bit(p, 1, v)
+ 
++static inline void srgn_ssd2828_spi_cs(struct srgn_ssd2828 *b, int level)
++{
++	srgn_gpio_set(&b->cs, level);
++	udelay(2);
++}
++
++static u16 srgn_ssd2828_spi_xfer9(struct srgn_ssd2828 *b, int dc, u8 tx)
++{
++	int bit;
++	u16 word = ((dc ? 1U : 0U) << 8) | tx;
++
++	for (bit = 8; bit >= 0; bit--) {
++		srgn_gpio_set(&b->scl, 0);
++		srgn_gpio_set(&b->sda, !!(word & (1U << bit)));
++		udelay(1);
++		srgn_gpio_set(&b->scl, 1);
++		udelay(1);
++	}
++	srgn_gpio_set(&b->scl, 0);
++
++	return 0;
++}
++
++static void srgn_ssd2828_write_reg(struct srgn_ssd2828 *b, u8 reg, u16 val)
++{
++	srgn_ssd2828_spi_cs(b, 0);
++	srgn_ssd2828_spi_xfer9(b, 0, reg);
++	srgn_ssd2828_spi_xfer9(b, 1, val & 0xFF);
++	srgn_ssd2828_spi_xfer9(b, 1, (val >> 8) & 0xFF);
++	srgn_ssd2828_spi_cs(b, 1);
++}
++
++static u16 srgn_ssd2828_construct_pll_config(u32 desired_pll_freq_kbps,
++					     u32 reference_freq_khz)
++{
++	u32 div_factor = 1, mul_factor, fr = 0;
++	u32 output_freq_kbps;
++
++	while (reference_freq_khz / (div_factor + 1) >= 5000)
++		div_factor++;
++	if (div_factor > 31)
++		div_factor = 31;
++
++	mul_factor = (desired_pll_freq_kbps * div_factor + reference_freq_khz - 1) /
++		     reference_freq_khz;
++
++	output_freq_kbps = reference_freq_khz * mul_factor / div_factor;
++	printf("srgn: set output freq to %u kbps\n", output_freq_kbps);
++
++	if (output_freq_kbps >= 501000)
++		fr = 3;
++	else if (output_freq_kbps >= 251000)
++		fr = 2;
++	else if (output_freq_kbps >= 126000)
++		fr = 1;
++
++	return (fr << 14) | (div_factor << 8) | mul_factor;
++}
++
++static void srgn_ssd2828_send_dcs_packet(struct srgn_ssd2828 *b,
++					 const u8 *buf, int len)
++{
++	int i;
++
++	if (!buf || len <= 0)
++		return;
++
++	srgn_ssd2828_write_reg(b, SSD2828_PSCR1, len);
++	srgn_ssd2828_write_reg(b, SSD2828_PSCR2, 0);
++
++	srgn_ssd2828_spi_cs(b, 0);
++	srgn_ssd2828_spi_xfer9(b, 0, SSD2828_PDR);
++	for (i = 0; i < len; i++)
++		srgn_ssd2828_spi_xfer9(b, 1, buf[i]);
++	srgn_ssd2828_spi_cs(b, 1);
++}
++
++static int srgn_ssd2828_basic_init(struct srgn_ssd2828 *b)
++{
++	u16 pll_config;
++	u32 pll_freq_kbps;
++	u32 lp_div;
++	u16 cfgr;
++
++	srgn_gpio_set(&b->cs, 1);
++	srgn_gpio_set(&b->scl, 1);
++	srgn_gpio_set(&b->sda, 1);
++
++	if (b->rst.valid) {
++		srgn_gpio_set(&b->rst, 0);
++		mdelay(100);
++		srgn_gpio_set(&b->rst, 1);
++		mdelay(100);
++	}
++
++	srgn_ssd2828_write_reg(b, SSD2828_VCR, 0);
++	srgn_ssd2828_write_reg(b, SSD2828_VICR1, (b->vsync << 8) | b->hsync);
++	srgn_ssd2828_write_reg(b, SSD2828_VICR2, (b->vbp << 8) | b->hbp);
++	srgn_ssd2828_write_reg(b, SSD2828_VICR3, (b->vfp << 8) | b->hfp);
++	srgn_ssd2828_write_reg(b, SSD2828_VICR4, b->xres);
++	srgn_ssd2828_write_reg(b, SSD2828_VICR5, b->yres);
++	srgn_ssd2828_write_reg(b, SSD2828_VICR6,
++				  SSD2828_VIDEO_PCLK_POL |
++			      SSD2828_VIDEO_MODE_BURST |
++			      SSD2828_VIDEO_PIXEL_FORMAT_16BPP);
++	srgn_ssd2828_write_reg(b, SSD2828_LCFR, SSD2828_DSI_LANES - 1);
++
++	cfgr = SSD2828_CFGR_EOT | SSD2828_CFGR_ECD;
++	cfgr &= ~SSD2828_CFGR_HS;
++	//cfgr |= SSD2828_CFGR_CKE | SSD2828_CFGR_DCS;
++	srgn_ssd2828_write_reg(b, SSD2828_CFGR, cfgr);
++
++	pll_config = srgn_ssd2828_construct_pll_config(SSD2828_DSI_MBPS * 1000,
++					      SSD2828_TX_CLK_KHZ);
++	srgn_ssd2828_write_reg(b, SSD2828_PLCR, pll_config);
++
++	pll_freq_kbps = (SSD2828_TX_CLK_KHZ * (pll_config & 0xFF)) /
++	       (((pll_config >> 8) & 0x1F) ? ((pll_config >> 8) & 0x1F) : 1);
++	lp_div = (pll_freq_kbps + SSD2828_LP_CLK_KHZ * 8 - 1) /
++		 (SSD2828_LP_CLK_KHZ * 8);
++	if (lp_div < 1)
++		lp_div = 1;
++	if (lp_div > 64)
++		lp_div = 64;
++	srgn_ssd2828_write_reg(b, SSD2828_CCR, (lp_div - 1) & 0x3F);
++
++	srgn_ssd2828_write_reg(b, SSD2828_PCR, 1);
++	udelay(500);
++
++	printf("srgn: SSD2828 configured for %ux%u @ %u kHz\n",
++	       b->xres, b->yres, b->pixelclock_khz);
++
++	return 0;
++}
++
++static int srgn_run_seq_via_ssd2828(struct srgn_ssd2828 *b,
++				    const fdt32_t *seq, int count)
++{
++	int i = 0;
++	int pending_cmd = -1;
++	u8 pkt[64];
++
++	printf("srgn: setup st7701 via ssd2828\n");
++	srgn_ssd2828_basic_init(b);
++
++#define NEXT() fdt32_to_cpu(seq[i++])
++	while (i < count) {
++		int op = NEXT();
++
++		switch (op) {
++		case ST7701INIT_BEGIN_WRITE:
++		case ST7701INIT_END_WRITE:
++			if (pending_cmd >= 0) {
++				pkt[0] = pending_cmd;
++				srgn_ssd2828_send_dcs_packet(b, pkt, 1);
++				pending_cmd = -1;
++			}
++			break;
++		case ST7701INIT_WRITE_COMMAND_8:
++			if (pending_cmd >= 0) {
++				pkt[0] = pending_cmd;
++				srgn_ssd2828_send_dcs_packet(b, pkt, 1);
++			}
++			pending_cmd = NEXT();
++			break;
++		case ST7701INIT_WRITE_C8_D8:
++			if (pending_cmd >= 0) {
++				pkt[0] = pending_cmd;
++				srgn_ssd2828_send_dcs_packet(b, pkt, 1);
++				pending_cmd = -1;
++			}
++			pkt[0] = NEXT();
++			pkt[1] = NEXT();
++			srgn_ssd2828_send_dcs_packet(b, pkt, 2);
++			break;
++		case ST7701INIT_WRITE_C8_D16:
++			if (pending_cmd >= 0) {
++				pkt[0] = pending_cmd;
++				srgn_ssd2828_send_dcs_packet(b, pkt, 1);
++				pending_cmd = -1;
++			}
++			pkt[0] = NEXT();
++			pkt[1] = NEXT();
++			pkt[2] = NEXT();
++			srgn_ssd2828_send_dcs_packet(b, pkt, 3);
++			break;
++		case ST7701INIT_WRITE_BYTES:
++		{
++			int len = NEXT();
++			int j;
++
++			if (pending_cmd < 0) {
++				printf("srgn: malformed init seq (WRITE_BYTES without cmd)\n");
++				return -1;
++			}
++
++			if (len + 1 > (int)sizeof(pkt)) {
++				printf("srgn: DCS packet too large: %d\n", len + 1);
++				return -1;
++			}
++
++			pkt[0] = pending_cmd;
++			for (j = 0; j < len && i < count; j++)
++				pkt[j + 1] = NEXT();
++
++			srgn_ssd2828_send_dcs_packet(b, pkt, len + 1);
++			pending_cmd = -1;
++			break;
++		}
++		case ST7701INIT_DELAY:
++			if (pending_cmd >= 0) {
++				pkt[0] = pending_cmd;
++				srgn_ssd2828_send_dcs_packet(b, pkt, 1);
++				pending_cmd = -1;
++			}
++			mdelay(NEXT());
++			break;
++		default:
++			printf("srgn: unknown st7701 op %d at %d\n", op, i - 1);
++			return -1;
++		}
++	}
++
++	if (pending_cmd >= 0) {
++		pkt[0] = pending_cmd;
++		srgn_ssd2828_send_dcs_packet(b, pkt, 1);
++	}
++#undef NEXT
++
++	srgn_ssd2828_write_reg(b, SSD2828_CFGR,
++			      SSD2828_CFGR_EOT | SSD2828_CFGR_ECD |
++			      SSD2828_CFGR_CKE | SSD2828_CFGR_DCS |
++			      SSD2828_CFGR_HS | SSD2828_CFGR_VEN);
++
++	printf("srgn: st7701 via ssd2828 init done\n");
++	return 0;
++}
++
++static int srgn_get_panel_timing(const void *blob, int node, struct srgn_ssd2828 *b)
++{
++	const fdt32_t *timing;
++	int len;
++
++	timing = fdt_getprop(blob, node, "srgn,panel-timing", &len);
++	if (!timing || len < 9 * (int)sizeof(fdt32_t)) {
++		printf("srgn: missing srgn,panel-timing\n");
++		return -1;
++	}
++
++	b->pixelclock_khz = fdt32_to_cpu(timing[0]);
++	b->xres = fdt32_to_cpu(timing[1]);
++	b->hfp = fdt32_to_cpu(timing[2]);
++	b->hsync = fdt32_to_cpu(timing[3]);
++	b->hbp = fdt32_to_cpu(timing[4]);
++	b->yres = fdt32_to_cpu(timing[5]);
++	b->vfp = fdt32_to_cpu(timing[6]);
++	b->vsync = fdt32_to_cpu(timing[7]);
++	b->vbp = fdt32_to_cpu(timing[8]);
++
++	return 0;
++}
++
++static int srgn_setup_ssd2828_from_fdt(const void *blob, int node,
++					struct srgn_ssd2828 *b)
++{
++	if (srgn_gpio_get(blob, node, "sda-gpios", &b->sda, 0) ||
++	    srgn_gpio_get(blob, node, "scl-gpios", &b->scl, 0) ||
++	    srgn_gpio_get(blob, node, "cs-gpios", &b->cs, 1) ||
++	    srgn_gpio_get(blob, node, "rst-gpios", &b->rst, 1)) {
++		printf("srgn: missing sda/scl/cs/rst gpios for ssd2828 mode\n");
++		return -1;
++	}
++
++	if (srgn_get_panel_timing(blob, node, b))
++		return -1;
++
++	return 0;
++}
++
+ static int srgn_run_seq(struct srgn_panel *p, const fdt32_t *seq, int count)
+ {
+ 	int i = 0, j, len, op;
+@@ -160,10 +485,12 @@ static int do_srgn_st7701init(struct cmd_tbl *cmdtp, int flag, int argc,
+ 			      char *const argv[])
+ {
+ 	struct srgn_panel p;
++	struct srgn_ssd2828 b;
+ 	const fdt32_t *seq;
+ 	unsigned long addr;
+ 	void *blob;
+ 	int node, len;
++	bool bridge_mode;
+ 
+ 	if (argc > 1)
+ 		addr = simple_strtoul(argv[1], NULL, 16);
+@@ -187,24 +514,37 @@ static int do_srgn_st7701init(struct cmd_tbl *cmdtp, int flag, int argc,
+ 		return 0;
+ 	}
+ 
++	bridge_mode = fdt_get_property(blob, node, "srgn,mipi-bridge-mode", NULL);
++
+ 	seq = fdt_getprop(blob, node, "init-sequence", &len);
+ 	if (!seq || len < (int)sizeof(fdt32_t)) {
+ 		printf("srgn: no init-sequence, skipping\n");
+ 		return 0;
+ 	}
+ 
+-	if (srgn_gpio_get(blob, node, "sda-gpios", &p.sda, 0) ||
+-	    srgn_gpio_get(blob, node, "scl-gpios", &p.scl, 0) ||
+-	    srgn_gpio_get(blob, node, "cs-gpios", &p.cs, 1)) {
+-		printf("srgn: missing sda/scl/cs gpios\n");
+-		return CMD_RET_FAILURE;
+-	}
+-	srgn_gpio_get(blob, node, "rst-gpios", &p.rst, 1);
+-
+ 	printf("srgn: st7701 init, %d cells\n", len / (int)sizeof(fdt32_t));
+-	if (srgn_run_seq(&p, seq, len / sizeof(fdt32_t))) {
+-		printf("srgn: init failed, leaving node enabled for kernel\n");
+-		return CMD_RET_FAILURE;
++
++	if (bridge_mode) {
++		if (srgn_setup_ssd2828_from_fdt(blob, node, &b))
++			return CMD_RET_FAILURE;
++
++		if (srgn_run_seq_via_ssd2828(&b, seq, len / sizeof(fdt32_t))) {
++			printf("srgn: ssd2828 init failed, leaving node enabled for kernel\n");
++			return CMD_RET_FAILURE;
++		}
++	} else {
++		if (srgn_gpio_get(blob, node, "sda-gpios", &p.sda, 0) ||
++		    srgn_gpio_get(blob, node, "scl-gpios", &p.scl, 0) ||
++		    srgn_gpio_get(blob, node, "cs-gpios", &p.cs, 1)) {
++			printf("srgn: missing sda/scl/cs gpios\n");
++			return CMD_RET_FAILURE;
++		}
++		srgn_gpio_get(blob, node, "rst-gpios", &p.rst, 1);
++
++		if (srgn_run_seq(&p, seq, len / sizeof(fdt32_t))) {
++			printf("srgn: init failed, leaving node enabled for kernel\n");
++			return CMD_RET_FAILURE;
++		}
+ 	}
+ 
+ 	/* done in u-boot: keep the kernel driver from re-running it */
+-- 
+2.34.1
+
