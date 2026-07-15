@@ -1,0 +1,159 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: iio: adc: sun4i-gpadc: F1C aux ADC stability fixes
+
+- F1C TP_CTRL1[3:0] are per-channel enables, not a channel number:
+  select channel 0 with BIT(0) instead of writing an empty mask
+- flush the FIFO after the mode/channel switch settles, not before,
+  so settling-window samples are never returned as the result
+- stay in aux ADC mode across runtime resume (thermal is disabled on
+  this platform), removing the 100ms TP->ADC switch on the first read
+  after every autosuspend and the pointless TPR temperature setup
+- T_ACQ 63->1023 (256us->4.1ms sample window) for the high-impedance
+  battery divider; fs back up from 30.5Hz (old 0005 patch) to 122Hz
+- express the voltage scale as FRACTIONAL 3000/4096 (same value as the
+  old INT_PLUS_NANO) so iio-rescale in 5.4 can propagate it
+- give the IIO device the MFD parent's of_node so DT io-channels
+  consumers (iio-rescale, adc-battery) can resolve it
+
+Replaces 0005-gpadc-low-freq.patch.
+--- a/drivers/iio/adc/sun4i-gpadc-iio.c	2026-07-15 15:16:19.730879934 +0800
++++ b/drivers/iio/adc/sun4i-gpadc-iio.c	2026-07-15 15:25:01.482741823 +0800
+@@ -38,7 +38,13 @@
+ 
+ static unsigned int sun4i_gpadc_chan_select(unsigned int chan)
+ {
+-	return SUN4I_GPADC_CTRL1_ADC_CHAN_SELECT(chan);
++	/*
++	 * On suniv (F1C100s/F1C200s) TP_CTRL1 bits [3:0] are per-channel
++	 * enable bits, not a binary channel number (see F1C200s user manual
++	 * 4.2.7.2). Writing the channel number would enable no channel at
++	 * all for channel 0.
++	 */
++	return SUN4I_GPADC_CTRL1_ADC_CHAN_SELECT(BIT(chan));
+ }
+ 
+ static unsigned int sun6i_gpadc_chan_select(unsigned int chan)
+@@ -172,12 +178,6 @@
+ 
+ 	reinit_completion(&info->completion);
+ 
+-	ret = regmap_write(info->regmap, SUN4I_GPADC_INT_FIFOC,
+-			   SUN4I_GPADC_INT_FIFOC_TP_FIFO_TRIG_LEVEL(1) |
+-			   SUN4I_GPADC_INT_FIFOC_TP_FIFO_FLUSH);
+-	if (ret)
+-		return ret;
+-
+ 	ret = regmap_read(info->regmap, SUN4I_GPADC_CTRL1, &reg);
+ 	if (ret)
+ 		return ret;
+@@ -187,6 +187,9 @@
+ 				   info->data->tp_mode_en |
+ 				   info->data->tp_adc_select |
+ 				   info->data->adc_chan_select(channel));
++		if (ret)
++			return ret;
++
+ 		/*
+ 		 * When the IP changes channel, it needs a bit of time to get
+ 		 * correct values.
+@@ -202,11 +205,10 @@
+ 		 */
+ 		ret = regmap_write(info->regmap, SUN4I_GPADC_CTRL1,
+ 				   info->data->tp_mode_en);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	if (ret)
+-		return ret;
+-
+ 	/*
+ 	 * When the IP changes mode between ADC or touchscreen, it
+ 	 * needs a bit of time to get correct values.
+@@ -214,7 +216,14 @@
+ 	if ((reg & info->data->tp_adc_select) != info->data->tp_adc_select)
+ 		mdelay(100);
+ 
+-	return 0;
++	/*
++	 * Flush the FIFO only after the mode/channel switch has settled;
++	 * samples converted during the settling window would otherwise be
++	 * returned as the measurement result.
++	 */
++	return regmap_write(info->regmap, SUN4I_GPADC_INT_FIFOC,
++			    SUN4I_GPADC_INT_FIFOC_TP_FIFO_TRIG_LEVEL(1) |
++			    SUN4I_GPADC_INT_FIFOC_TP_FIFO_FLUSH);
+ }
+ 
+ static int sun4i_gpadc_read(struct iio_dev *indio_dev, int channel, int *val,
+@@ -329,10 +338,15 @@
+ 		return IIO_VAL_INT;
+ 	case IIO_CHAN_INFO_SCALE:
+ 		if (chan->type == IIO_VOLTAGE) {
+-			/* 3000mV / 4096 * raw */
+-			*val = 0;
+-			*val2 = 732421875;
+-			return IIO_VAL_INT_PLUS_NANO;
++			/*
++			 * 3000mV / 4096 * raw. Expressed as FRACTIONAL (same
++			 * value as the old INT_PLUS_NANO 0.732421875) because
++			 * iio-rescale in 5.4 can only propagate FRACTIONAL,
++			 * INT and FRACTIONAL_LOG2 scales.
++			 */
++			*val = 3000;
++			*val2 = 4096;
++			return IIO_VAL_FRACTIONAL;
+ 		}
+ 
+ 		ret = sun4i_gpadc_temp_scale(indio_dev, val);
+@@ -395,19 +409,27 @@
+ {
+ 	struct sun4i_gpadc_iio *info = iio_priv(dev_get_drvdata(dev));
+ 
+-	/* clkin = 6MHz */
++	/*
++	 * CLK_IN = 24MHz / 6 = 4MHz, fs = CLK_IN / 2^(20 - 5) = 122Hz.
++	 * T_ACQ(1023) gives a 16 * 1024 / CLK_IN = 4.1ms sample/hold window
++	 * per conversion: the battery sense divider is high-impedance, so
++	 * the S/H cap needs far longer than the 256us used for touch plates.
++	 */
+ 	regmap_write(info->regmap, SUN4I_GPADC_CTRL0,
+ 		     SUN4I_GPADC_CTRL0_ADC_CLK_DIVIDER(2) |
+-		     SUN4I_GPADC_CTRL0_FS_DIV(7) |
+-		     SUN4I_GPADC_CTRL0_T_ACQ(63));
+-	regmap_write(info->regmap, SUN4I_GPADC_CTRL1, info->data->tp_mode_en);
++		     SUN4I_GPADC_CTRL0_FS_DIV(5) |
++		     SUN4I_GPADC_CTRL0_T_ACQ(1023));
++	/*
++	 * Stay in aux ADC mode so the first read after resume does not go
++	 * through a TP->ADC mode switch (100ms settle + dirty first sample).
++	 * The temperature sensor needs TP mode, but CONFIG_THERMAL is off on
++	 * this platform, so don't enable it (TPR) either.
++	 */
++	regmap_write(info->regmap, SUN4I_GPADC_CTRL1,
++		     info->data->tp_mode_en | info->data->tp_adc_select);
+ 	regmap_write(info->regmap, SUN4I_GPADC_CTRL3,
+ 		     SUN4I_GPADC_CTRL3_FILTER_EN |
+-		     SUN4I_GPADC_CTRL3_FILTER_TYPE(1));
+-	/* period = SUN4I_GPADC_TPR_TEMP_PERIOD * 256 * 16 / clkin; ~0.6s */
+-	regmap_write(info->regmap, SUN4I_GPADC_TPR,
+-		     SUN4I_GPADC_TPR_TEMP_ENABLE |
+-		     SUN4I_GPADC_TPR_TEMP_PERIOD(800));
++		     SUN4I_GPADC_CTRL3_FILTER_TYPE(3));
+ 
+ 	return 0;
+ }
+@@ -538,6 +560,13 @@
+ 	info->no_irq = false;
+ 	info->regmap = sun4i_gpadc_dev->regmap;
+ 
++	/*
++	 * MFD children get no of_node, so DT consumers referencing this IIO
++	 * provider via io-channels = <&rtp N> could never resolve it. Borrow
++	 * the parent's node (the one io-channels actually points at).
++	 */
++	indio_dev->dev.of_node = pdev->dev.parent->of_node;
++
+ 	indio_dev->num_channels = ARRAY_SIZE(sun4i_gpadc_channels);
+ 	indio_dev->channels = sun4i_gpadc_channels;
+ 

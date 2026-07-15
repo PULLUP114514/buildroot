@@ -1,0 +1,638 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: power: supply: generic-adc-battery: backport v6.4 DT rewrite
+
+Backport of the v6.4 rewrite (compatible "adc-battery", io-channels
+named "voltage"/"current"/"power"/"temperature", monitored-battery),
+adapted to the 5.4 value-semantics power_supply_battery_info API,
+plus local extensions the upstream driver does not have:
+
+- CAPACITY computed from the monitored-battery OCV table via
+  power_supply_batinfo_ocv2cap() (assumes 20C)
+- optional charging-threshold-microvolt / charging-hysteresis-microvolt:
+  report CHARGING when the sensed voltage exceeds the threshold
+  (charger pulls the rail above any possible battery OCV), with
+  hysteresis (default threshold/100) so the status does not flap
+- PRESENT/TECHNOLOGY/VOLTAGE_{MIN,MAX}_DESIGN for interface parity
+  with axp20x-battery on the epass_p family
+- charging_capacity_reliable sysfs attribute (always 0): OCV-derived
+  capacity pins near 100% while the charger lifts the sense rail.
+  Fuel-gauge supplies don't have this file; userspace treats a
+  missing file as "capacity stays valid while charging"
+--- a/drivers/power/supply/generic-adc-battery.c	2026-07-15 15:16:19.732017040 +0800
++++ b/drivers/power/supply/generic-adc-battery.c	2026-07-15 16:27:11.719987641 +0800
+@@ -1,18 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+- * Generic battery driver code using IIO
++ * Generic battery driver using IIO
+  * Copyright (C) 2012, Anish Kumar <anish198519851985@gmail.com>
+- * based on jz4740-battery.c
+- * based on s3c_adc_battery.c
+- *
+- * This file is subject to the terms and conditions of the GNU General Public
+- * License.  See the file COPYING in the main directory of this archive for
+- * more details.
++ * Copyright (c) 2023, Sebastian Reichel <sre@kernel.org>
+  *
++ * Backport of the v6.4 DT-enabled rewrite to 5.4, plus local extensions:
++ * - CAPACITY derived from the monitored-battery OCV table
++ * - STATUS guessed from a voltage threshold (charging-threshold-microvolt)
++ *   for boards whose only charge indication is the charger pulling the
++ *   battery sense rail above any possible open-circuit voltage
+  */
+ #include <linux/interrupt.h>
+ #include <linux/platform_device.h>
+ #include <linux/power_supply.h>
+-#include <linux/gpio.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/err.h>
+ #include <linux/timer.h>
+ #include <linux/jiffies.h>
+@@ -22,14 +23,18 @@
+ #include <linux/slab.h>
+ #include <linux/iio/consumer.h>
+ #include <linux/iio/types.h>
+-#include <linux/power/generic-adc-battery.h>
++#include <linux/of.h>
+ 
+ #define JITTER_DEFAULT 10 /* hope 10ms is enough */
+ 
++/* assume room temperature when picking an OCV table */
++#define GAB_OCV_TEMP_C 20
++
+ enum gab_chan_type {
+ 	GAB_VOLTAGE = 0,
+ 	GAB_CURRENT,
+ 	GAB_POWER,
++	GAB_TEMP,
+ 	GAB_MAX_CHAN_TYPE
+ };
+ 
+@@ -40,18 +45,23 @@
+ static const char *const gab_chan_name[] = {
+ 	[GAB_VOLTAGE]	= "voltage",
+ 	[GAB_CURRENT]	= "current",
+-	[GAB_POWER]		= "power",
++	[GAB_POWER]	= "power",
++	[GAB_TEMP]	= "temperature",
+ };
+ 
+ struct gab {
+-	struct power_supply		*psy;
+-	struct power_supply_desc	psy_desc;
+-	struct iio_channel	*channel[GAB_MAX_CHAN_TYPE];
+-	struct gab_platform_data	*pdata;
++	struct power_supply *psy;
++	struct power_supply_desc psy_desc;
++	struct iio_channel *channel[GAB_MAX_CHAN_TYPE];
+ 	struct delayed_work bat_work;
+-	int	level;
+-	int	status;
+-	bool cable_plugged;
++	int status;
++	struct gpio_desc *charge_finished;
++	struct power_supply_battery_info info;
++	bool has_info;
++	bool has_ocv;
++	u32 charging_uv;
++	u32 charging_hyst_uv;
++	bool vsense_charging;
+ };
+ 
+ static struct gab *to_generic_bat(struct power_supply *psy)
+@@ -68,15 +78,8 @@
+ 
+ static const enum power_supply_property gab_props[] = {
+ 	POWER_SUPPLY_PROP_STATUS,
+-	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+-	POWER_SUPPLY_PROP_CHARGE_EMPTY_DESIGN,
+-	POWER_SUPPLY_PROP_CHARGE_NOW,
+-	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+-	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_PRESENT,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+-	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
+-	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
+-	POWER_SUPPLY_PROP_MODEL_NAME,
+ };
+ 
+ /*
+@@ -87,132 +90,138 @@
+ 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+ 	POWER_SUPPLY_PROP_CURRENT_NOW,
+ 	POWER_SUPPLY_PROP_POWER_NOW,
++	POWER_SUPPLY_PROP_TEMP,
+ };
+ 
+ static bool gab_charge_finished(struct gab *adc_bat)
+ {
+-	struct gab_platform_data *pdata = adc_bat->pdata;
+-	bool ret = gpio_get_value(pdata->gpio_charge_finished);
+-	bool inv = pdata->gpio_inverted;
+-
+-	if (!gpio_is_valid(pdata->gpio_charge_finished))
++	if (!adc_bat->charge_finished)
+ 		return false;
+-	return ret ^ inv;
++	return gpiod_get_value(adc_bat->charge_finished);
+ }
+ 
+-static int gab_get_status(struct gab *adc_bat)
++static int gab_read_channel(struct gab *adc_bat, enum gab_chan_type channel,
++		int *result)
+ {
+-	struct gab_platform_data *pdata = adc_bat->pdata;
+-	struct power_supply_info *bat_info;
++	int ret;
++
++	ret = iio_read_channel_processed(adc_bat->channel[channel], result);
++	if (ret < 0)
++		dev_err(&adc_bat->psy->dev, "read channel error: %d\n", ret);
++	else
++		*result *= 1000;
+ 
+-	bat_info = &pdata->battery_info;
+-	if (adc_bat->level == bat_info->charge_full_design)
+-		return POWER_SUPPLY_STATUS_FULL;
+-	return adc_bat->status;
++	return ret;
+ }
+ 
+-static enum gab_chan_type gab_prop_to_chan(enum power_supply_property psp)
++/*
++ * No charge detection hardware: infer it from the sense voltage. A charger
++ * pulls the sense rail above any voltage a disconnected battery can reach,
++ * with hysteresis so the reported status doesn't flap around the threshold.
++ */
++static int gab_vsense_status(struct gab *adc_bat, int *status)
+ {
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_POWER_NOW:
+-		return GAB_POWER;
+-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-		return GAB_VOLTAGE;
+-	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		return GAB_CURRENT;
+-	default:
+-		WARN_ON(1);
+-		break;
+-	}
+-	return GAB_POWER;
++	int uv, ret;
++
++	ret = gab_read_channel(adc_bat, GAB_VOLTAGE, &uv);
++	if (ret < 0)
++		return ret;
++
++	if (uv >= adc_bat->charging_uv)
++		adc_bat->vsense_charging = true;
++	else if (uv < adc_bat->charging_uv - adc_bat->charging_hyst_uv)
++		adc_bat->vsense_charging = false;
++
++	*status = adc_bat->vsense_charging ? POWER_SUPPLY_STATUS_CHARGING :
++					     POWER_SUPPLY_STATUS_DISCHARGING;
++	return 0;
+ }
+ 
+-static int read_channel(struct gab *adc_bat, enum power_supply_property psp,
+-		int *result)
++static int gab_get_capacity(struct gab *adc_bat, int *capacity)
+ {
+-	int ret;
+-	int chan_index;
++	int uv, ret;
+ 
+-	chan_index = gab_prop_to_chan(psp);
+-	ret = iio_read_channel_processed(adc_bat->channel[chan_index],
+-			result);
++	ret = gab_read_channel(adc_bat, GAB_VOLTAGE, &uv);
+ 	if (ret < 0)
+-		pr_err("read channel error\n");
+-	return ret;
++		return ret;
++
++	ret = power_supply_batinfo_ocv2cap(&adc_bat->info, uv, GAB_OCV_TEMP_C);
++	if (ret < 0)
++		return ret;
++
++	*capacity = ret;
++	return 0;
+ }
+ 
+ static int gab_get_property(struct power_supply *psy,
+ 		enum power_supply_property psp, union power_supply_propval *val)
+ {
+-	struct gab *adc_bat;
+-	struct gab_platform_data *pdata;
+-	struct power_supply_info *bat_info;
+-	int result = 0;
+-	int ret = 0;
+-
+-	adc_bat = to_generic_bat(psy);
+-	if (!adc_bat) {
+-		dev_err(&psy->dev, "no battery infos ?!\n");
+-		return -EINVAL;
+-	}
+-	pdata = adc_bat->pdata;
+-	bat_info = &pdata->battery_info;
++	struct gab *adc_bat = to_generic_bat(psy);
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		val->intval = gab_get_status(adc_bat);
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_EMPTY_DESIGN:
+-		val->intval = 0;
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_NOW:
+-		val->intval = pdata->cal_charge(result);
+-		break;
+-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-	case POWER_SUPPLY_PROP_POWER_NOW:
+-		ret = read_channel(adc_bat, psp, &result);
+-		if (ret < 0)
+-			goto err;
+-		val->intval = result;
+-		break;
++		if (adc_bat->charging_uv)
++			return gab_vsense_status(adc_bat, &val->intval);
++		val->intval = adc_bat->status;
++		return 0;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		return 0;
+ 	case POWER_SUPPLY_PROP_TECHNOLOGY:
+-		val->intval = bat_info->technology;
+-		break;
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		return 0;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		if (!adc_bat->has_ocv)
++			return -ENODATA;
++		return gab_get_capacity(adc_bat, &val->intval);
+ 	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
+-		val->intval = bat_info->voltage_min_design;
+-		break;
++		if (!adc_bat->has_info || adc_bat->info.voltage_min_design_uv < 0)
++			return -ENODATA;
++		val->intval = adc_bat->info.voltage_min_design_uv;
++		return 0;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+-		val->intval = bat_info->voltage_max_design;
+-		break;
+-	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+-		val->intval = bat_info->charge_full_design;
+-		break;
+-	case POWER_SUPPLY_PROP_MODEL_NAME:
+-		val->strval = bat_info->name;
+-		break;
++		if (!adc_bat->has_info || adc_bat->info.voltage_max_design_uv < 0)
++			return -ENODATA;
++		val->intval = adc_bat->info.voltage_max_design_uv;
++		return 0;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		return gab_read_channel(adc_bat, GAB_VOLTAGE, &val->intval);
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		return gab_read_channel(adc_bat, GAB_CURRENT, &val->intval);
++	case POWER_SUPPLY_PROP_POWER_NOW:
++		return gab_read_channel(adc_bat, GAB_POWER, &val->intval);
++	case POWER_SUPPLY_PROP_TEMP:
++		return gab_read_channel(adc_bat, GAB_TEMP, &val->intval);
+ 	default:
+ 		return -EINVAL;
+ 	}
+-err:
+-	return ret;
+ }
+ 
++/*
++ * Capacity comes from an OCV lookup of the sensed voltage; while charging,
++ * the charger pulls that rail above any open-circuit voltage (that is what
++ * the charging threshold detects), so the lookup pins near 100% and must
++ * not be trusted. Fuel-gauge backed supplies (axp20x-battery) don't expose
++ * this file: userspace should treat a missing file as "reliable".
++ */
++static ssize_t charging_capacity_reliable_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "0\n");
++}
++static DEVICE_ATTR_RO(charging_capacity_reliable);
++
+ static void gab_work(struct work_struct *work)
+ {
+ 	struct gab *adc_bat;
+ 	struct delayed_work *delayed_work;
+-	bool is_plugged;
+ 	int status;
+ 
+ 	delayed_work = to_delayed_work(work);
+ 	adc_bat = container_of(delayed_work, struct gab, bat_work);
+ 	status = adc_bat->status;
+ 
+-	is_plugged = power_supply_am_i_supplied(adc_bat->psy);
+-	adc_bat->cable_plugged = is_plugged;
+-
+-	if (!is_plugged)
++	if (!power_supply_am_i_supplied(adc_bat->psy))
+ 		adc_bat->status =  POWER_SUPPLY_STATUS_DISCHARGING;
+ 	else if (gab_charge_finished(adc_bat))
+ 		adc_bat->status = POWER_SUPPLY_STATUS_NOT_CHARGING;
+@@ -226,119 +235,171 @@
+ static irqreturn_t gab_charged(int irq, void *dev_id)
+ {
+ 	struct gab *adc_bat = dev_id;
+-	struct gab_platform_data *pdata = adc_bat->pdata;
+-	int delay;
+ 
+-	delay = pdata->jitter_delay ? pdata->jitter_delay : JITTER_DEFAULT;
+ 	schedule_delayed_work(&adc_bat->bat_work,
+-			msecs_to_jiffies(delay));
++			      msecs_to_jiffies(JITTER_DEFAULT));
++
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * The property list must be final before power_supply_register(), but
++ * power_supply_get_battery_info() needs the registered psy. Peek at the
++ * monitored-battery node to decide what to expose, fetch the data later.
++ */
++static void gab_scan_battery_node(struct platform_device *pdev,
++				  bool *has_vmin, bool *has_vmax,
++				  bool *has_ocv)
++{
++	struct device_node *np;
++
++	np = of_parse_phandle(pdev->dev.of_node, "monitored-battery", 0);
++	if (!np)
++		return;
++
++	*has_vmin = of_property_read_bool(np, "voltage-min-design-microvolt");
++	*has_vmax = of_property_read_bool(np, "voltage-max-design-microvolt");
++	*has_ocv = of_find_property(np, "ocv-capacity-table-0", NULL) != NULL;
++	of_node_put(np);
++}
++
+ static int gab_probe(struct platform_device *pdev)
+ {
+ 	struct gab *adc_bat;
+ 	struct power_supply_desc *psy_desc;
+ 	struct power_supply_config psy_cfg = {};
+-	struct gab_platform_data *pdata = pdev->dev.platform_data;
++	enum power_supply_property *properties;
++	bool has_vmin = false, has_vmax = false, has_ocv = false;
+ 	int ret = 0;
+ 	int chan;
+ 	int index = ARRAY_SIZE(gab_props);
+ 	bool any = false;
+ 
+ 	adc_bat = devm_kzalloc(&pdev->dev, sizeof(*adc_bat), GFP_KERNEL);
+-	if (!adc_bat) {
+-		dev_err(&pdev->dev, "failed to allocate memory\n");
++	if (!adc_bat)
+ 		return -ENOMEM;
+-	}
+ 
++	psy_cfg.of_node = pdev->dev.of_node;
+ 	psy_cfg.drv_data = adc_bat;
+ 	psy_desc = &adc_bat->psy_desc;
+-	psy_desc->name = pdata->battery_info.name;
++	psy_desc->name = dev_name(&pdev->dev);
+ 
+ 	/* bootup default values for the battery */
+-	adc_bat->cable_plugged = false;
+ 	adc_bat->status = POWER_SUPPLY_STATUS_DISCHARGING;
+ 	psy_desc->type = POWER_SUPPLY_TYPE_BATTERY;
+ 	psy_desc->get_property = gab_get_property;
+ 	psy_desc->external_power_changed = gab_ext_power_changed;
+-	adc_bat->pdata = pdata;
+ 
+-	/*
+-	 * copying the static properties and allocating extra memory for holding
+-	 * the extra configurable properties received from platform data.
+-	 */
+-	psy_desc->properties = kcalloc(ARRAY_SIZE(gab_props) +
+-					ARRAY_SIZE(gab_chan_name),
+-					sizeof(*psy_desc->properties),
+-					GFP_KERNEL);
+-	if (!psy_desc->properties) {
+-		ret = -ENOMEM;
+-		goto first_mem_fail;
+-	}
++	gab_scan_battery_node(pdev, &has_vmin, &has_vmax, &has_ocv);
+ 
+-	memcpy(psy_desc->properties, gab_props, sizeof(gab_props));
++	properties = devm_kcalloc(&pdev->dev,
++				  ARRAY_SIZE(gab_props) +
++				  ARRAY_SIZE(gab_chan_name) + 3,
++				  sizeof(*properties),
++				  GFP_KERNEL);
++	if (!properties)
++		return -ENOMEM;
++
++	memcpy(properties, gab_props, sizeof(gab_props));
+ 
+ 	/*
+ 	 * getting channel from iio and copying the battery properties
+ 	 * based on the channel supported by consumer device.
+ 	 */
+ 	for (chan = 0; chan < ARRAY_SIZE(gab_chan_name); chan++) {
+-		adc_bat->channel[chan] = iio_channel_get(&pdev->dev,
+-							 gab_chan_name[chan]);
++		adc_bat->channel[chan] = devm_iio_channel_get(&pdev->dev, gab_chan_name[chan]);
+ 		if (IS_ERR(adc_bat->channel[chan])) {
+ 			ret = PTR_ERR(adc_bat->channel[chan]);
++			if (ret != -ENODEV) {
++				if (ret != -EPROBE_DEFER)
++					dev_err(&pdev->dev, "Failed to get ADC channel %s: %d\n",
++						gab_chan_name[chan], ret);
++				return ret;
++			}
+ 			adc_bat->channel[chan] = NULL;
+-		} else {
++		} else if (adc_bat->channel[chan]) {
+ 			/* copying properties for supported channels only */
+ 			int index2;
+ 
+ 			for (index2 = 0; index2 < index; index2++) {
+-				if (psy_desc->properties[index2] ==
+-				    gab_dyn_props[chan])
++				if (properties[index2] == gab_dyn_props[chan])
+ 					break;	/* already known */
+ 			}
+ 			if (index2 == index)	/* really new */
+-				psy_desc->properties[index++] =
+-					gab_dyn_props[chan];
++				properties[index++] = gab_dyn_props[chan];
+ 			any = true;
+ 		}
+ 	}
+ 
+ 	/* none of the channels are supported so let's bail out */
+ 	if (!any) {
+-		ret = -ENODEV;
+-		goto second_mem_fail;
++		dev_err(&pdev->dev, "Failed to get any ADC channel\n");
++		return -ENODEV;
+ 	}
+ 
+-	/*
+-	 * Total number of properties is equal to static properties
+-	 * plus the dynamic properties.Some properties may not be set
+-	 * as come channels may be not be supported by the device.So
+-	 * we need to take care of that.
+-	 */
++	if (adc_bat->channel[GAB_VOLTAGE]) {
++		if (has_ocv)
++			properties[index++] = POWER_SUPPLY_PROP_CAPACITY;
++	} else {
++		has_ocv = false;
++	}
++	if (has_vmin)
++		properties[index++] = POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN;
++	if (has_vmax)
++		properties[index++] = POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN;
++
++	psy_desc->properties = properties;
+ 	psy_desc->num_properties = index;
+ 
+-	adc_bat->psy = power_supply_register(&pdev->dev, psy_desc, &psy_cfg);
++	if (adc_bat->channel[GAB_VOLTAGE]) {
++		of_property_read_u32(pdev->dev.of_node,
++				     "charging-threshold-microvolt",
++				     &adc_bat->charging_uv);
++		adc_bat->charging_hyst_uv = adc_bat->charging_uv / 100;
++		of_property_read_u32(pdev->dev.of_node,
++				     "charging-hysteresis-microvolt",
++				     &adc_bat->charging_hyst_uv);
++	}
++
++	adc_bat->psy = devm_power_supply_register(&pdev->dev, psy_desc, &psy_cfg);
+ 	if (IS_ERR(adc_bat->psy)) {
+ 		ret = PTR_ERR(adc_bat->psy);
+-		goto err_reg_fail;
++		if (ret != -EPROBE_DEFER)
++			dev_err(&pdev->dev, "Failed to register power-supply device: %d\n",
++				ret);
++		return ret;
++	}
++
++	ret = power_supply_get_battery_info(adc_bat->psy, &adc_bat->info);
++	adc_bat->has_info = ret == 0;
++	adc_bat->has_ocv = has_ocv && adc_bat->has_info;
++	if (has_ocv && !adc_bat->has_info)
++		dev_warn(&pdev->dev, "monitored-battery info unavailable: %d\n",
++			 ret);
++
++	if (adc_bat->has_ocv) {
++		ret = device_create_file(&adc_bat->psy->dev,
++					 &dev_attr_charging_capacity_reliable);
++		if (ret)
++			dev_warn(&pdev->dev,
++				 "failed to create charging_capacity_reliable: %d\n",
++				 ret);
+ 	}
+ 
+ 	INIT_DELAYED_WORK(&adc_bat->bat_work, gab_work);
+ 
+-	if (gpio_is_valid(pdata->gpio_charge_finished)) {
++	adc_bat->charge_finished = devm_gpiod_get_optional(&pdev->dev, "charged", GPIOD_IN);
++	if (IS_ERR(adc_bat->charge_finished))
++		return PTR_ERR(adc_bat->charge_finished);
++	if (adc_bat->charge_finished) {
+ 		int irq;
+-		ret = gpio_request(pdata->gpio_charge_finished, "charged");
+-		if (ret)
+-			goto gpio_req_fail;
+ 
+-		irq = gpio_to_irq(pdata->gpio_charge_finished);
+-		ret = request_any_context_irq(irq, gab_charged,
++		irq = gpiod_to_irq(adc_bat->charge_finished);
++		ret = devm_request_any_context_irq(&pdev->dev, irq, gab_charged,
+ 				IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+ 				"battery charged", adc_bat);
+ 		if (ret < 0)
+-			goto err_gpio;
++			return ret;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, adc_bat);
+@@ -347,42 +408,13 @@
+ 	schedule_delayed_work(&adc_bat->bat_work,
+ 			msecs_to_jiffies(0));
+ 	return 0;
+-
+-err_gpio:
+-	gpio_free(pdata->gpio_charge_finished);
+-gpio_req_fail:
+-	power_supply_unregister(adc_bat->psy);
+-err_reg_fail:
+-	for (chan = 0; chan < ARRAY_SIZE(gab_chan_name); chan++) {
+-		if (adc_bat->channel[chan])
+-			iio_channel_release(adc_bat->channel[chan]);
+-	}
+-second_mem_fail:
+-	kfree(psy_desc->properties);
+-first_mem_fail:
+-	return ret;
+ }
+ 
+ static int gab_remove(struct platform_device *pdev)
+ {
+-	int chan;
+ 	struct gab *adc_bat = platform_get_drvdata(pdev);
+-	struct gab_platform_data *pdata = adc_bat->pdata;
+-
+-	power_supply_unregister(adc_bat->psy);
+ 
+-	if (gpio_is_valid(pdata->gpio_charge_finished)) {
+-		free_irq(gpio_to_irq(pdata->gpio_charge_finished), adc_bat);
+-		gpio_free(pdata->gpio_charge_finished);
+-	}
+-
+-	for (chan = 0; chan < ARRAY_SIZE(gab_chan_name); chan++) {
+-		if (adc_bat->channel[chan])
+-			iio_channel_release(adc_bat->channel[chan]);
+-	}
+-
+-	kfree(adc_bat->psy_desc.properties);
+-	cancel_delayed_work(&adc_bat->bat_work);
++	cancel_delayed_work_sync(&adc_bat->bat_work);
+ 	return 0;
+ }
+ 
+@@ -398,23 +430,27 @@
+ static int __maybe_unused gab_resume(struct device *dev)
+ {
+ 	struct gab *adc_bat = dev_get_drvdata(dev);
+-	struct gab_platform_data *pdata = adc_bat->pdata;
+-	int delay;
+-
+-	delay = pdata->jitter_delay ? pdata->jitter_delay : JITTER_DEFAULT;
+ 
+ 	/* Schedule timer to check current status */
+ 	schedule_delayed_work(&adc_bat->bat_work,
+-			msecs_to_jiffies(delay));
++			      msecs_to_jiffies(JITTER_DEFAULT));
++
+ 	return 0;
+ }
+ 
+ static SIMPLE_DEV_PM_OPS(gab_pm_ops, gab_suspend, gab_resume);
+ 
++static const struct of_device_id gab_match[] = {
++	{ .compatible = "adc-battery" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, gab_match);
++
+ static struct platform_driver gab_driver = {
+ 	.driver		= {
+ 		.name	= "generic-adc-battery",
+ 		.pm	= &gab_pm_ops,
++		.of_match_table = gab_match,
+ 	},
+ 	.probe		= gab_probe,
+ 	.remove		= gab_remove,

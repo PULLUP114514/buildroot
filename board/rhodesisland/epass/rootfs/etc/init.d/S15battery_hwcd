@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# epass 电量指示 daemon
+#
+# 独立于主 app / DRM master,尽早拉起即可(只依赖 sysfs + /dev/input)。
+
+PIDFILE=/var/run/battery_hwcd.pid
+
+start() {
+	command -v battery_hwcd > /dev/null || exit 0
+	echo "battery_hwcd: starting" > /dev/kmsg
+	start-stop-daemon -S -q -m -b -p "$PIDFILE" -x "$(command -v battery_hwcd)"
+}
+
+stop() {
+	[ -f "$PIDFILE" ] && start-stop-daemon -K -q -p "$PIDFILE"
+	rm -f "$PIDFILE"
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart)
+		stop
+		sleep 1
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

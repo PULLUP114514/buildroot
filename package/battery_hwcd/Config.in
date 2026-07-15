@@ -1,0 +1,10 @@
+config BR2_PACKAGE_BATTERY_HWCD
+	bool "battery_hwcd"
+	help
+	  Userspace battery indicator daemon for the epass DEBE hardware
+	  cursor overlay.  Reads /sys/class/power_supply and drives the
+	  /sys/kernel/battery_hwc/ overlay (independent of the DRM master):
+	  hidden above 10% until a key is pressed, red 1Hz blink below 10%,
+	  a charging bolt while plugged in.
+
+	  Requires the sun4i backend HWC overlay kernel patch.
