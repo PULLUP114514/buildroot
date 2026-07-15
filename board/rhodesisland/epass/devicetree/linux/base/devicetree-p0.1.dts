@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR X11)
+/dts-v1/;
+#include "epass_p.dtsi"
+
+/ {
+	model = "ArkEPass-P v0.1";
+};
