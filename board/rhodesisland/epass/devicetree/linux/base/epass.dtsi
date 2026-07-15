@@ -1,44 +1,13 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR X11)
 
-/dts-v1/;
-#include "suniv-f1c100s.dtsi"
-#include <dt-bindings/input/input.h>
-#include <dt-bindings/gpio/gpio.h>
-#include <dt-bindings/display/st7701initseq.h>
+#include "epass_common.dtsi"
 
 / {
-	model = "ArkEPass Generic";
-	compatible = "rhodesisland,electric-pass",
-	         "allwinner,suniv-f1c200s",
-			 "allwinner,suniv-f1c100s";
-
 	chosen {
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges;
-
 		// this bootargs will not work. change bootargs in uboot!
 		bootargs = "i luv mostima";
-
 	};
 
-	panel: panel {
-		compatible = "lattland,mostima", "simple-panel";	// 360x640 3 inch
-
-		#address-cells = <1>;
-		#size-cells = <0>;
-
-		port@0 {
-			reg = <0>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			panel_input: endpoint@0 {
-				reg = <0>;
-				remote-endpoint = <&tcon0_out_lcd>;
-			};
-		};
-	};
 	reg_vcc3v3: vcc3v3 {
 		compatible = "regulator-fixed";
 		regulator-name = "vcc3v3";
@@ -53,192 +22,88 @@
 		regulator-max-microvolt = <3000000>;
 	};
 
-	backlight {
-		compatible = "pwm-backlight";
-		pwms = <&pwm 0 10000 0>;
-		
-
-		brightness-levels = <0 4 8 16 32 64 128 196 220 255>;
-		default-brightness-level = <6>;
+	bat: battery {
+		compatible = "simple-battery";
+		voltage-min-design-microvolt = <3300000>;
+		voltage-max-design-microvolt = <4200000>;
+		ocv-capacity-celsius = <20>;
+		/*
+		 * 初版由 drm_app_neo config.h 的 raw 阈值(2140/2230/2320/2410/2500)
+		 * 按 raw*0.7324mV*2.294 换算,保持与现有图标分档一致;待上板
+		 * 万用表标定后细化(真实 Li-ion OCV 曲线是非线性的)
+		 */
+		ocv-capacity-table-0 = <4200000 100>, <4050000 75>,
+				       <3900000 50>, <3750000 25>,
+				       <3600000 0>;
 	};
 
-	reserved-memory {
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges;
-
-		// VE dedicated CMA pool: can be borrowed by page cache/anonymous pages when idle, and reclaimed by the driver when decoding.
-		cedar_reserved: cedar-pool {
-			compatible = "shared-dma-pool";
-			reusable;
-			size = <0x1000000>;
-			alignment = <0x400000>;
-		};
+	vbat_sense: voltage-divider {
+		compatible = "voltage-divider";
+		io-channels = <&rtp 0>;	/* PA0 = aux ADC chan0 */
+		/* 分压比 2.294 由 app 旧阈值(full=raw2500≈4.2V)反推,待标定 */
+		full-ohms = <2294>;
+		output-ohms = <1000>;
+		#io-channel-cells = <1>;
 	};
 
-	st7701initseq: st7701initseq {
-		compatible = "lattland,st7701-initseq";
-		status = "disabled";
+	adc_bat: adc-battery {
+		compatible = "adc-battery";
+		io-channels = <&vbat_sense 0>;
+		io-channel-names = "voltage";
+		monitored-battery = <&bat>;
+		/* 对应旧 raw 阈值 2600;充电器把采样轨拉到电池 OCV 达不到的电压 */
+		charging-threshold-microvolt = <4370000>;
 	};
 };
 
+&panel {
+	compatible = "lattland,mostima", "simple-panel";	// 360x640 3 inch
+};
+
 &pio{
-
-
-	spi1_pins: spi1-pins {
-		pins = "PE7","PE8", "PE9", "PE10";
-		function = "spi1";
-		bias-pull-up;
-	};
-
 	rtp_pins_0: rtp-pins-0 {
 		pins = "PA0";
 		function = "rtp";
 	};
 
-    rtp_pins_01: rtp-pins-01 {
+	rtp_pins_01: rtp-pins-01 {
 		pins = "PA0","PA1";
 		function = "rtp";
 	};
-	
+
 	lcd_rgb565_no_de_pins: lcd-rgb565-no-de-pins {
 		pins = "PD1", "PD2", "PD3", "PD4", "PD5",
-			"PD6", "PD7", "PD8", "PD9", "PD10", "PD11", 
+			"PD6", "PD7", "PD8", "PD9", "PD10", "PD11",
 			"PD13", "PD14", "PD15", "PD16", "PD17",
 			"PD18", "PD20", "PD21";
 		function = "lcd";
 	};
 
-    i2s_pins_pe: i2s-pins-pe {
+	i2s_pins_pe: i2s-pins-pe {
 		pins = "PE3","PE5","PE6","PA1";
 		function = "i2s";
 	};
 
-    i2s_pins_pa: i2s-pins-pa {
+	i2s_pins_pa: i2s-pins-pa {
 		pins = "PE3","PA2","PA3","PA1";
 		function = "i2s";
 	};
-
-    
 };
 
-&pwm {
-	pinctrl-names = "default";
-	pinctrl-0 = <&pwm0_pe_pins>;
-	status = "okay";
-};
-
-
-&spi0 {
-	status = "okay";
-
-	spi-nand@0 {
-		#address-cells = <1>;
-		#size-cells = <1>;
-		compatible = "spi-nand";
-		reg = <0>;
-		spi-max-frequency = <80000000>;
-		status = "okay";
-
-		partitions {
-			compatible = "fixed-partitions";
-			#address-cells = <1>;
-			#size-cells = <1>;
-
-			partition@0 {
-				label = "u-boot";
-				reg = <0x000000 0x0e0000>;
-				read-only;
-			};
-
-			partition@e0000 {
-				label = "bootenv";
-				reg = <0x0e0000 0x020000>;
-			};
-
-			partition@100000 {
-				label = "boot";
-				reg = <0x100000 0x600000>;
-			};
-
-			partition@700000 {
-				label = "rootfs";
-				reg = <0x700000 0x7900000>;
-			};
-		};
-	};
-};
-
-&spi1 {
-	pinctrl-names = "default";
-	pinctrl-0 = <&spi1_pins>;
-	status = "disabled";
-	spidev@0 {
-	   compatible = "rohm,dh2228fv";	/* Same as "spidev" but without errors at boot. Search "buggy DT" to understand */
-	   spi-max-frequency = <80000000>;
-	   reg = <0>;
-	};
-};
-
-&uart0 {
-	pinctrl-names = "default";
-	pinctrl-0 = <&uart0_pe_pins>;
-	status = "okay";
-};
 &uart1 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart1_pa_pins>;
 	status = "disabled";
 };
+
 &uart2 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart2_pe_pins>;
 	status = "disabled";
 };
 
-&mmc0 {	
+&mmc0 {
 	vmmc-supply = <&reg_vcc3v3>;
-	bus-width = <4>;
-	status = "okay";
-	broken-cd;
-};
-
-&otg_sram {
-	status = "okay";
-};
-
-&usb_otg {
-	dr_mode = "otg"; /* otg host peripheral */
-	status = "okay";
-};
-
-&usbphy {
-	status = "okay";
-};
-
-&cedar_ve {
-	memory-region = <&cedar_reserved>;
-	status = "okay";
-};
-
-&ion {
-	status = "okay";
-};
-
-&de {
-	status = "okay";
-};
-
-&fe0 {
-	status = "okay";
-};
-
-&be0 {
-	status = "okay";
-};
-
-&tve0 {
-	status = "disabled";
 };
 
 &rtp {
@@ -251,13 +116,6 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&lcd_rgb565_no_de_pins>;
 	status = "okay";
-};
-
-&tcon0_out {
-	tcon0_out_lcd: endpoint@0 {
-		reg = <0>;
-		remote-endpoint = <&panel_input>;
-	};
 };
 
 &lradc {

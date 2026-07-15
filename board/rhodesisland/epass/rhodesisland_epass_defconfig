@@ -19,7 +19,7 @@ BR2_LINUX_KERNEL_PATCH="board/allwinner/suniv-f1c100s/patch/linux board/rhodesis
 BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
 BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="board/rhodesisland/epass/linux.defconfig"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
-BR2_LINUX_KERNEL_CUSTOM_DTS_PATH="board/allwinner/suniv-f1c100s/devicetree/linux/suniv-f1c100s.dtsi board/rhodesisland/epass/devicetree/linux/base/epass.dtsi board/rhodesisland/epass/devicetree/linux/base/devicetree-0.3.dts"
+BR2_LINUX_KERNEL_CUSTOM_DTS_PATH="board/allwinner/suniv-f1c100s/devicetree/linux/suniv-f1c100s.dtsi board/rhodesisland/epass/devicetree/linux/base/epass_common.dtsi board/rhodesisland/epass/devicetree/linux/base/epass.dtsi board/rhodesisland/epass/devicetree/linux/base/devicetree-0.3.dts"
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="board/rhodesisland/epass/busybox.fragment"
 BR2_PACKAGE_EPASS_DRM_APP=y
 BR2_PACKAGE_EPASS_APPLICATIONS=y
@@ -40,6 +40,7 @@ BR2_PACKAGE_MTD_MTDPART=y
 # BR2_PACKAGE_MTD_NANDWRITE is not set
 BR2_PACKAGE_FB_TEST_APP=y
 BR2_PACKAGE_DRMTEST=y
+BR2_PACKAGE_BATTERY_HWCD=y
 BR2_PACKAGE_EVTEST=y
 BR2_PACKAGE_MINICOM=y
 BR2_PACKAGE_TINYALSA=y

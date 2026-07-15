@@ -1,7 +1,49 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR X11)
 /dts-v1/;
 #include "epass_p.dtsi"
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	model = "ArkEPass-P v0.1";
+
+	buttons {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		button-0 {
+			label = "Number_1";
+			linux,code = <KEY_1>;
+			gpios = <&pio 0 0 GPIO_ACTIVE_LOW>; /* PA0 */
+		};
+
+		button-1 {
+			label = "Number_2";
+			linux,code = <KEY_2>;
+			gpios = <&pio 0 1 GPIO_ACTIVE_LOW>; /* PA1 */
+		};
+
+		button-2 {
+			label = "Number_3";
+			linux,code = <KEY_3>;
+			gpios = <&pio 0 2 GPIO_ACTIVE_LOW>; /* PA2 */
+		};
+
+		button-3 {
+			label = "Number_4";
+			linux,code = <KEY_4>;
+			gpios = <&pio 0 3 GPIO_ACTIVE_LOW>; /* PA3 */
+		};
+	};
+};
+
+&st7701initseq {
+	sda-gpios = <&pio 4 4 GPIO_ACTIVE_HIGH>; /* PE4 */
+	scl-gpios = <&pio 4 6 GPIO_ACTIVE_HIGH>; /* PE6 */
+	cs-gpios = <&pio 4 3 GPIO_ACTIVE_HIGH>; /* PE3 */
+	rst-gpios = <&pio 4 11 GPIO_ACTIVE_HIGH>; /* PE11 */
+};
+
+&axp209 {
+	interrupt-parent = <&pio>;
+	interrupts = <4 2 IRQ_TYPE_LEVEL_LOW>; /* PE2 */
 };
