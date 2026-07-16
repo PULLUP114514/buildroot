@@ -1,0 +1,90 @@
+suniv: SPL: detect boot source from BROM stack (mainline fel_stash trick)
+
+BROM 加载 SPL 的例程会把返回地址留在 BROM 栈上, save_boot_params 存的
+fel_stash.sp 正好指向它。据此 SPL 直接选定启动介质, SPI 启动不再先等
+MMC 超时; 认不出的返回值打印后退回原盲试顺序。常量取自主线 U-Boot,
+实测 epass SPI NAND 启动返回 0xffff4114 (BROM NAND 例程), 映射到 SPI。
+
+--- a/arch/arm/include/asm/arch-sunxi/spl.h	2026-07-16 20:52:47.838211760 +0800
++++ b/arch/arm/include/asm/arch-sunxi/spl.h	2026-07-16 20:52:12.790368954 +0800
+@@ -31,6 +31,16 @@
+ #define SUNXI_BOOTED_FROM_MMC0_HIGH	0x10
+ #define SUNXI_BOOTED_FROM_MMC2_HIGH	0x12
+ 
++/*
++ * suniv BROM 不传 boot_media,但加载 SPL 的 BROM 例程把返回地址留在了
++ * BROM 栈上(fel_stash.sp - 4),用它反推启动介质。值取自 F1C100s/200s
++ * BROM,与主线 U-Boot 一致。
++ */
++#define SUNIV_BOOTED_FROM_MMC0	0xffff40f8
++#define SUNIV_BOOTED_FROM_NAND	0xffff4114
++#define SUNIV_BOOTED_FROM_SPI	0xffff4130
++#define SUNIV_BOOTED_FROM_MMC1	0xffff4150
++
+ /* boot head definition from sun4i boot code */
+ struct boot_file_head {
+ 	uint32_t b_instruction;	/* one intruction jumping to real code */
+--- a/arch/arm/mach-sunxi/board.c	2026-07-16 20:52:44.451321969 +0800
++++ b/arch/arm/mach-sunxi/board.c	2026-07-17 00:20:37.188564712 +0800
+@@ -325,9 +325,32 @@
+ }
+ #else
+ /*
+- * suniv BROM do not pass the boot media type to SPL, so we try with the
+- * boot sequence in BROM: mmc0->spinor->fail.
++ * suniv BROM 不传 boot_media,但 save_boot_params 存下的 fel_stash.sp
++ * 仍指向 BROM 的栈,栈顶(sp - 4)是加载我们的那个 BROM 例程的返回
++ * 地址,据此区分 MMC0/SPI 启动(主线 U-Boot 同款做法)。
++ * 只有 SPL 能用:proper 入口会重新跑 save_boot_params,fel_stash 里
++ * 存的已经是 SPL 的栈了。
+  */
++static int suniv_get_boot_source(void)
++{
++	u32 brom_call = *(u32 *)(uintptr_t)(fel_stash.sp - 4);
++
++	switch (brom_call) {
++	case SUNIV_BOOTED_FROM_MMC0:
++		return SUNXI_BOOTED_FROM_MMC0;
++	case SUNIV_BOOTED_FROM_SPI:
++	/* 实测 epass 从 SPI NAND 启动时 BROM 走的是 NAND 例程 */
++	case SUNIV_BOOTED_FROM_NAND:
++		return SUNXI_BOOTED_FROM_SPI;
++	case SUNIV_BOOTED_FROM_MMC1:
++		return SUNXI_BOOTED_FROM_MMC2;
++	}
++
++	printf("Unknown BROM boot call 0x%x, guessing boot order\n",
++	       brom_call);
++	return SUNXI_INVALID_BOOT_SOURCE;
++}
++
+ void board_boot_order(u32 *spl_boot_list)
+ {
+ 	/*
+@@ -339,9 +362,23 @@
+ 		return;
+ 	}
+ 
+-	spl_boot_list[0] = BOOT_DEVICE_MMC1;
+-	spl_boot_list[1] = BOOT_DEVICE_MMC2;
+-	spl_boot_list[2] = BOOT_DEVICE_SPI;
++	switch (suniv_get_boot_source()) {
++	case SUNXI_BOOTED_FROM_MMC0:
++		spl_boot_list[0] = BOOT_DEVICE_MMC1;
++		break;
++	case SUNXI_BOOTED_FROM_SPI:
++		spl_boot_list[0] = BOOT_DEVICE_SPI;
++		break;
++	case SUNXI_BOOTED_FROM_MMC2:
++		spl_boot_list[0] = BOOT_DEVICE_MMC2;
++		break;
++	default:
++		/* 认不出就退回 BROM 的盲试顺序 mmc0->spi */
++		spl_boot_list[0] = BOOT_DEVICE_MMC1;
++		spl_boot_list[1] = BOOT_DEVICE_MMC2;
++		spl_boot_list[2] = BOOT_DEVICE_SPI;
++		break;
++	}
+ }
+ #endif
+ 
