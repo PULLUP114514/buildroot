@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# DRAM 主端口仲裁调优,治视频播放时 DE 供线不稳导致的画面抖动。
+#
+# 背景: F1C 的 DRAMC 每个 master 有一个配置寄存器(0x01c01100 起),
+# 字段: [29:28] QoS, [15:12] ACS(一次仲裁连发的命令数),
+#       [27:16]+[11:0] BWL1/BWL0(带宽限制,MB/s,0 不限)。
+# 复位默认全 0。overlay+720p30 满载时
+# 显示三层取数 ~425MB/s,逼近 DDR1 有效带宽,VE 解码突发会把
+# DEFE/DEBE 挤掉行,表现为整屏 Y 向抖动。
+#
+
+DRAMC=0x01c01000
+
+case "$1" in
+    start | restart | reload) ;;
+    stop)
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+devmem $((DRAMC + 0x11c)) 32 0x30000000  # DEFE: QoS=3 ACS=15
+# DEBE要给够burst
+devmem $((DRAMC + 0x118)) 32 0x3000F000  # DEBE: QoS=3 ACS=15
+
+# 暂时不限制 VE 带宽
+# devmem $((DRAMC + 0x120)) 32 0x00000064  # VE:   BWL0=100MB/s
