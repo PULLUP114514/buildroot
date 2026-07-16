@@ -155,6 +155,10 @@
 	status = "disabled";
 };
 
+&cedar_ve {
+	status = "okay";
+};
+
 &tcon0_out {
 	tcon0_out_lcd: endpoint@0 {
 		reg = <0>;

@@ -7,6 +7,20 @@
 		// this bootargs will not work. change bootargs in uboot!
 		bootargs = "i luv papyrus";
 	};
+
+	/* 720x1280 scanout */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x2000000>; /* 32 MiB */
+			linux,cma-default;
+		};
+	};
 };
 
 &panel {
@@ -27,10 +41,25 @@
 		reg = <0x34>;
 		interrupt-controller;
 		#interrupt-cells = <1>;
+
+		/* PEK 是面板上的 "0" 键, 不是关机键 */
+		x-powers,pek-keycode = <KEY_0>;
 	};
 };
 
 #include "axp209.dtsi"
+
+&battery_power_supply {
+	status = "okay";
+};
+
+&ac_power_supply {
+	status = "okay";
+};
+
+&usb_power_supply {
+	status = "okay";
+};
 
 &reg_dcdc2 {
 	regulator-min-microvolt = <1200000>;
