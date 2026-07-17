@@ -1,0 +1,334 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] srgn: pick the verbose-boot key from the DT, and stop waiting for it
+
+The hold-to-boot-verbose key was hardwired to the LRADC, which is wrong on
+epass-p: that board has no resistor ladder, its keys are plain GPIOs (see
+devicetree-p0.1.dts, gpio-keys-polled on PA0/PA1) and its lradc node stays
+disabled. Reading the LRADC there samples a floating input.
+
+Both commands now read the kernel DT -- already loaded and patched by the
+time they run -- and follow whatever it describes: LRADC keys if the lradc
+node is enabled and lists any, otherwise gpio-keys/gpio-keys-polled. The
+gpio path drives the pull to match the declared polarity, since the binding
+leaves biasing to the driver and says nothing about the pin's boot state.
+
+The 200ms settle is gone. LRADC needs ~512ms after being enabled before its
+first conversion is valid, and init_sun4i_lradc paid for that by blocking.
+But it is called long before the key is read: the panel init and the kernel
+FIT read sit in between and take ~1s on their own. So arming now returns
+immediately and the settle overlaps work that had to happen anyway;
+chk_verbose_boot tops the wait up from a timestamp if it is ever called
+early enough to matter. Boards with GPIO keys skip the arming entirely.
+
+init_sun4i_lradc is renamed init_verbose_key since it no longer necessarily
+touches the LRADC, and both commands now take the DT address the way
+srgn_st7701init and srgn_splash already do.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -933,13 +933,19 @@
+ 	  before Linux takes over.
+ 
+ config SRGN_LRADC
+-	bool "init_sun4i_lradc / chk_verbose_boot for suniv KEYADC"
++	bool "init_verbose_key / chk_verbose_boot for suniv boards"
+ 	depends on MACH_SUNIV
+ 	help
+-	  Adds init_sun4i_lradc (enable F1C100s LRADC @ 0x01c23400 with a
+-	  long settle) and chk_verbose_boot (returns 0 if any key held,
+-	  1 otherwise). Env skips quiet when true, e.g.
+-	  if chk_verbose_boot; then true; else setenv bootargs "... quiet"; fi
++	  Adds init_verbose_key <fdt> and chk_verbose_boot <fdt>, which read
++	  the loaded kernel DT to find the hold-to-boot-verbose key: LRADC
++	  keys (F1C100s KEYADC @ 0x01c23400) if the lradc node is enabled and
++	  lists any, otherwise gpio-keys. chk_verbose_boot returns 0 if a key
++	  is held, 1 otherwise; env skips quiet when true, e.g.
++	  if chk_verbose_boot ${dtbaddr}; then true; else
++	      setenv bootargs "... quiet"; fi
++	  Arming is split out because LRADC needs ~512ms to settle: call
++	  init_verbose_key right after the DT is patched and the settle
++	  overlaps the panel init and kernel read for free.
+ 
+ config SUNXI_DE2
+ 	bool
+
+--- a/board/sunxi/srgn_lradc.c
++++ b/board/sunxi/srgn_lradc.c
+@@ -1,19 +1,31 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+- * suniv LRADC (KEYADC) helpers for hold-to-verbose-boot.
++ * Hold-a-key-to-boot-verbose for suniv boards.
++ *
++ * Which key that is depends on the board: the 0.x boards hang a resistor
++ * ladder off the LRADC, epass-p wires plain GPIOs. Rather than hardcoding
++ * either, both commands read the kernel DT that has already been loaded and
++ * patched and follow whatever it describes.
+  *
+  * F1C100s LRADC sits at 0x01c23400 (NOT sun4i SUNXI_LRADC_BASE 0x01c22800).
+  * No clock/reset gate; dedicated non-muxed pin. Register layout matches
+  * Linux drivers/input/keyboard/sun4i-lradc-keys.c.
+  *
++ * LRADC needs ~512 ms after being enabled before its first conversion is
++ * valid (FIRST_CONVERT_DLY), which is why arming and sampling are separate
++ * commands: init_verbose_key arms it and returns, the boot script goes on to
++ * init the panel and read the kernel image, and by the time chk_verbose_boot
++ * samples, the settle has already happened for free. chk_verbose_boot tops
++ * the wait up anyway in case it ever gets called earlier than that.
++ *
+  * Usage from env (console= stays; quiet is the switch):
+- *   init_sun4i_lradc
+- *   ... load / patch / splash ...
+- *   if chk_verbose_boot; then true; else
++ *   init_verbose_key ${dtbaddr}     # once the DT is loaded and patched
++ *   ... panel init / splash / load kernel ...
++ *   if chk_verbose_boot ${dtbaddr}; then true; else
+  *       setenv bootargs "${bootargs} quiet";
+  *   fi
+  *
+- * chk_verbose_boot returns 0 (true) if any key is held, 1 (false) otherwise.
++ * chk_verbose_boot returns 0 (true) if a key is held, 1 (false) otherwise.
+  * It does not touch bootargs.
+  *
+  * Rhodes Island Engineering Dept, 1097
+@@ -21,8 +33,12 @@
+ 
+ #include <common.h>
+ #include <command.h>
++#include <fdtdec.h>
+ #include <linux/delay.h>
++#include <linux/libfdt.h>
+ #include <asm/io.h>
++#include <asm/arch/gpio.h>
++#include <dt-bindings/gpio/gpio.h>
+ 
+ /* suniv / F1C100s KEYADC — see board DT lradc@1c23400 */
+ #define SUNIV_LRADC_BASE	0x01c23400
+@@ -44,79 +60,183 @@
+  */
+ #define LRADC_PRESSED_MAX	55
+ 
+-/* FIRST_CONVERT_DLY(128) @ 250 Hz ~= 512 ms before first valid sample */
+ #define LRADC_INIT_CTRL		(FIRST_CONVERT_DLY(128) | LEVELA_B_CNT(3) | \
+ 				 HOLD_EN(1) | SAMPLE_RATE(0) | ENABLE(1))
+ 
+-/* Extra wall-clock settle after enabling (on top of FIRST_CONVERT_DLY) */
+-#define LRADC_INIT_SETTLE_MS	200
++/* FIRST_CONVERT_DLY(128) @ 250 Hz ~= 512 ms before the first valid sample */
++#define LRADC_SETTLE_MS		512
+ 
+-static int lradc_inited;
++static ulong lradc_armed_at;
++static int lradc_armed;
+ 
+-static int do_init_sun4i_lradc(struct cmd_tbl *cmdtp, int flag, int argc,
+-			       char *const argv[])
++static const void *verbose_key_fdt(int argc, char *const argv[])
+ {
+-	if (argc != 1)
+-		return CMD_RET_USAGE;
++	const void *fdt;
+ 
+-	/* Clear pending IRQs; we poll DATA0, never use interrupts */
+-	writel(0, SUNIV_LRADC_BASE + LRADC_INTC);
+-	writel(0x1ff, SUNIV_LRADC_BASE + LRADC_INTS);
++	if (argc != 2)
++		return NULL;
+ 
+-	writel(LRADC_INIT_CTRL, SUNIV_LRADC_BASE + LRADC_CTRL);
+-	mdelay(LRADC_INIT_SETTLE_MS);
++	fdt = (const void *)simple_strtoul(argv[1], NULL, 16);
++	if (fdt_check_header(fdt))
++		return NULL;
+ 
+-	lradc_inited = 1;
+-	printf("lradc: enabled (settle %u ms + first-convert dly 128)\n",
+-	       LRADC_INIT_SETTLE_MS);
++	return fdt;
++}
+ 
+-	return CMD_RET_SUCCESS;
++/* LRADC keys are only usable if the node is enabled and lists any key */
++static int fdt_has_lradc_keys(const void *fdt)
++{
++	int node;
++
++	node = fdt_node_offset_by_compatible(fdt, -1,
++					     "allwinner,sun4i-a10-lradc-keys");
++	if (node < 0 || !fdtdec_get_is_enabled(fdt, node))
++		return 0;
++
++	return fdt_first_subnode(fdt, node) >= 0;
++}
++
++static int fdt_gpio_keys_node(const void *fdt)
++{
++	int node;
++
++	node = fdt_node_offset_by_compatible(fdt, -1, "gpio-keys-polled");
++	if (node < 0)
++		node = fdt_node_offset_by_compatible(fdt, -1, "gpio-keys");
++	if (node < 0 || !fdtdec_get_is_enabled(fdt, node))
++		return -1;
++
++	return node;
++}
++
++static int gpio_keys_held(const void *fdt, int node)
++{
++	int sub, held = 0;
++
++	fdt_for_each_subnode(sub, fdt, node) {
++		const fdt32_t *prop;
++		struct sunxi_gpio *pio;
++		u32 bank, pin, flags;
++		const char *label;
++		int len, low, val;
++
++		prop = fdt_getprop(fdt, sub, "gpios", &len);
++		if (!prop || len < 4 * (int)sizeof(fdt32_t))
++			continue;
++
++		/* <&pio bank pin flags>, pio has #gpio-cells = <3> */
++		bank = fdt32_to_cpu(prop[1]);
++		pin = fdt32_to_cpu(prop[2]);
++		flags = fdt32_to_cpu(prop[3]);
++		low = flags & GPIO_ACTIVE_LOW;
++
++		/*
++		 * The gpio-keys binding leaves biasing to the driver, so drive
++		 * the pull the way the polarity implies instead of trusting
++		 * whatever state the pin was left in.
++		 */
++		sunxi_gpio_set_cfgpin(bank * 32 + pin, SUNXI_GPIO_INPUT);
++		sunxi_gpio_set_pull(bank * 32 + pin,
++				    low ? SUNXI_GPIO_PULL_UP :
++					  SUNXI_GPIO_PULL_DOWN);
++		udelay(100);
++
++		pio = BANK_TO_GPIO(bank);
++		val = (readl(&pio->dat) >> pin) & 1;
++
++		if (low ? !val : val) {
++			label = fdt_getprop(fdt, sub, "label", NULL);
++			printf("key: %s held\n", label ? label : "?");
++			held = 1;
++		}
++	}
++
++	return held;
+ }
+ 
+-static void lradc_disable(void)
++static int lradc_keys_held(void)
+ {
++	ulong waited = get_timer(lradc_armed_at);
++	u32 a, b;
++
++	if (waited < LRADC_SETTLE_MS)
++		mdelay(LRADC_SETTLE_MS - waited);
++
++	/* Two samples a sample-period apart; both must look pressed */
++	a = readl(SUNIV_LRADC_BASE + LRADC_DATA0) & 0x3f;
++	mdelay(8);
++	b = readl(SUNIV_LRADC_BASE + LRADC_DATA0) & 0x3f;
++
++	/* Hand it back to the kernel the way we found it */
+ 	writel(FIRST_CONVERT_DLY(2) | LEVELA_B_CNT(1) | HOLD_EN(1) |
+ 	       SAMPLE_RATE(2), SUNIV_LRADC_BASE + LRADC_CTRL);
+ 	writel(0, SUNIV_LRADC_BASE + LRADC_INTC);
+-	lradc_inited = 0;
++	lradc_armed = 0;
++
++	printf("lradc: raw=%u,%u\n", a, b);
++
++	return a <= LRADC_PRESSED_MAX && b <= LRADC_PRESSED_MAX;
+ }
+ 
+-static int do_chk_verbose_boot(struct cmd_tbl *cmdtp, int flag, int argc,
++static int do_init_verbose_key(struct cmd_tbl *cmdtp, int flag, int argc,
+ 			       char *const argv[])
+ {
+-	u32 a, b;
+-	int pressed;
++	const void *fdt = verbose_key_fdt(argc, argv);
+ 
+-	if (argc != 1)
++	if (!fdt)
+ 		return CMD_RET_USAGE;
+ 
+-	if (!lradc_inited) {
+-		printf("lradc: not inited, run init_sun4i_lradc first\n");
+-		return CMD_RET_FAILURE;
+-	}
++	/* GPIO keys are readable at any time and need no warm-up */
++	if (!fdt_has_lradc_keys(fdt))
++		return CMD_RET_SUCCESS;
+ 
+-	/* Two samples a sample-period apart; both must look pressed */
+-	a = readl(SUNIV_LRADC_BASE + LRADC_DATA0) & 0x3f;
+-	mdelay(8);
+-	b = readl(SUNIV_LRADC_BASE + LRADC_DATA0) & 0x3f;
++	/* Clear pending IRQs; we poll DATA0, never use interrupts */
++	writel(0, SUNIV_LRADC_BASE + LRADC_INTC);
++	writel(0x1ff, SUNIV_LRADC_BASE + LRADC_INTS);
++	writel(LRADC_INIT_CTRL, SUNIV_LRADC_BASE + LRADC_CTRL);
++
++	lradc_armed_at = get_timer(0);
++	lradc_armed = 1;
++	printf("lradc: armed, settling behind the kernel load\n");
++
++	return CMD_RET_SUCCESS;
++}
++
++static int do_chk_verbose_boot(struct cmd_tbl *cmdtp, int flag, int argc,
++			       char *const argv[])
++{
++	const void *fdt = verbose_key_fdt(argc, argv);
++	int node;
++
++	if (!fdt)
++		return CMD_RET_USAGE;
+ 
+-	lradc_disable();
++	if (lradc_armed)
++		return lradc_keys_held() ? CMD_RET_SUCCESS : CMD_RET_FAILURE;
+ 
+-	pressed = (a <= LRADC_PRESSED_MAX && b <= LRADC_PRESSED_MAX);
+-	printf("lradc: raw=%u,%u pressed=%d\n", a, b, pressed);
++	node = fdt_gpio_keys_node(fdt);
++	if (node >= 0)
++		return gpio_keys_held(fdt, node) ? CMD_RET_SUCCESS :
++						   CMD_RET_FAILURE;
++
++	/*
++	 * The DT asks for LRADC keys but nobody armed the controller, so
++	 * there is nothing trustworthy to sample.
++	 */
++	if (fdt_has_lradc_keys(fdt))
++		printf("verbose key: run init_verbose_key first\n");
+ 
+-	/* 0 = true for `if chk_verbose_boot`, 1 = false */
+-	return pressed ? CMD_RET_SUCCESS : CMD_RET_FAILURE;
++	return CMD_RET_FAILURE;
+ }
+ 
+ U_BOOT_CMD(
+-	init_sun4i_lradc, 1, 0, do_init_sun4i_lradc,
+-	"enable suniv LRADC/KEYADC and wait for settle",
+-	""
++	init_verbose_key, 2, 0, do_init_verbose_key,
++	"arm the verbose-boot key described by a DT, without waiting for it",
++	"<fdt_addr> - e.g. ${dtbaddr}"
+ );
+ 
+ U_BOOT_CMD(
+-	chk_verbose_boot, 1, 0, do_chk_verbose_boot,
+-	"return 0 if any LRADC key held, 1 otherwise",
+-	""
++	chk_verbose_boot, 2, 0, do_chk_verbose_boot,
++	"return 0 if the DT's verbose-boot key is held, 1 otherwise",
++	"<fdt_addr> - e.g. ${dtbaddr}"
+ );
