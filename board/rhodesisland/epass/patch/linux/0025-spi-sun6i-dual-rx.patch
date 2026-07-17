@@ -1,0 +1,73 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] spi: sun6i: support dual mode RX (DOUT reads)
+
+The suniv SPI controller can clock reads out over both data pins, which
+the driver never exposed. F1C200s manual 7.3.7.11 describes SPI_BCC_REG
+(0x38) bit 28 as DRM, "Master Dual Mode RX Enable". The driver already
+maps that register, it just uses the STC field of it.
+
+Only RX is covered. There is no dual TX bit, and bit 29 (QUAD_EN on
+A31/H3) is reserved on suniv anyway -- the pin list in manual 7.3.4 has
+SPI_SCLK/SPI_MOSI/SPI_MISO/SPI_SS[3:0] and no D2/D3 -- so dual reads are
+the only widening this SoC can do, and they need no extra wiring.
+
+spi-mem splits a 1-1-2 op into single-bit TX transfers for cmd/addr/dummy
+plus one RX-only transfer carrying rx_nbits = 2, so the STC/DBC burst
+composition in the BCC register is never needed: the RX-only transfer
+programs MBC/MTC/STC exactly as the single-bit path already does and only
+adds DRM. This matches what the BSP driver does for DUAL_HALF_DUPLEX_RX
+(spi_set_bc_tc_stc(0, len, 0, 0) plus spi_enable_dual()).
+
+With this, spinand_select_op_variant() stops falling through to 0x0B Fast
+Read and picks SPINAND_PAGE_READ_FROM_CACHE_X2_OP (0x3B) for chips whose
+read_cache_variants offer it, halving the cache-to-host phase. The DMA
+path is unaffected: bus width does not change how bytes land in the FIFO.
+
+Requires spi-rx-bus-width = <2> on the slave node to take effect.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+--- a/drivers/spi/spi-sun6i.c
++++ b/drivers/spi/spi-sun6i.c
+@@ -83,6 +83,12 @@
+
+ #define SUN6I_BURST_CTL_CNT_REG		0x38
+ #define SUN6I_BURST_CTL_CNT_STC(cnt)		((cnt) & SUN6I_MAX_XFER_SIZE)
++/*
++ * DRM only switches the RX direction to two lines; there is no dual TX.
++ * On suniv bit 29 (QUAD_EN on A31/H3) is reserved and SPI_MOSI/SPI_MISO
++ * are the only data pins, so quad is not reachable here.
++ */
++#define SUN6I_BURST_CTL_CNT_DRM			BIT(28)
+
+ #define SUN6I_TXDATA_REG		0x200
+ #define SUN6I_RXDATA_REG		0x300
+@@ -424,8 +430,16 @@
+ 	/* Setup the counters */
+ 	sun6i_spi_write(sspi, SUN6I_BURST_CNT_REG, SUN6I_BURST_CNT(tfr->len));
+ 	sun6i_spi_write(sspi, SUN6I_XMIT_CNT_REG, SUN6I_XMIT_CNT(tx_len));
+-	sun6i_spi_write(sspi, SUN6I_BURST_CTL_CNT_REG,
+-			SUN6I_BURST_CTL_CNT_STC(tx_len));
++
++	/*
++	 * The counters are unaffected by the bus width: a burst is always one
++	 * byte, dual mode just clocks it out in half the cycles. Plain
++	 * assignment also clears DRM for every non-dual transfer.
++	 */
++	reg = SUN6I_BURST_CTL_CNT_STC(tx_len);
++	if (rx_len && tfr->rx_nbits == SPI_NBITS_DUAL)
++		reg |= SUN6I_BURST_CTL_CNT_DRM;
++	sun6i_spi_write(sspi, SUN6I_BURST_CTL_CNT_REG, reg);
+
+ 	if (!use_dma) {
+ 		/* Fill the TX FIFO */
+@@ -640,7 +654,8 @@
+ 	master->set_cs = sun6i_spi_set_cs;
+ 	master->transfer_one = sun6i_spi_transfer_one;
+ 	master->num_chipselect = 4;
+-	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST;
++	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST |
++			    SPI_RX_DUAL;
+ 	master->bits_per_word_mask = SPI_BPW_MASK(8);
+ 	master->dev.of_node = pdev->dev.of_node;
+ 	master->auto_runtime_pm = true;

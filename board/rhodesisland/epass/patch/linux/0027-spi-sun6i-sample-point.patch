@@ -1,0 +1,61 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] spi: sun6i: move the read sample point with the bus speed
+
+SPI_TCR has two bits controlling when the master samples MISO, and the
+driver leaves both at zero regardless of speed. That happens to be the
+right setting for the middle of the range, which is why this has never
+been noticed, but it does not hold at either end.
+
+Past roughly 60MHz the round trip -- SCLK propagating to the slave and its
+data coming back -- no longer fits inside the setup time, and SDC (bit 11)
+has to delay the sample point by half an SCLK cycle. Below roughly 24MHz
+the default delay is itself the problem and SDM (bit 13) selects plain
+sampling instead. Manual 7.3.7.2 documents both; the thresholds are the
+ones the BSP driver applies in sunxi_spi_mode_check().
+
+This matters on suniv now: the CDR2 divider hangs off the 200MHz AHB, so
+the reachable rates are 100/50/33MHz and nothing in between. Asking for
+anything under 100 lands on 50, which sits in the no-adjustment window --
+but 100MHz needs SDC, so the frequency cannot be raised without this.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+--- a/drivers/spi/spi-sun6i.c
++++ b/drivers/spi/spi-sun6i.c
+@@ -43,9 +43,15 @@
+ #define SUN6I_TFR_CTL_CS_MANUAL			BIT(6)
+ #define SUN6I_TFR_CTL_CS_LEVEL			BIT(7)
+ #define SUN6I_TFR_CTL_DHB			BIT(8)
++#define SUN6I_TFR_CTL_SDC			BIT(11)
+ #define SUN6I_TFR_CTL_FBS			BIT(12)
++#define SUN6I_TFR_CTL_SDM			BIT(13)
+ #define SUN6I_TFR_CTL_XCH			BIT(31)
+ 
++/* Speeds at which the read sample point has to move, as used by the BSP */
++#define SUN6I_SPI_HIGH_FREQ		60000000
++#define SUN6I_SPI_LOW_FREQ		24000000
++
+ #define SUN6I_INT_CTL_REG		0x10
+ #define SUN6I_INT_CTL_RF_RDY			BIT(0)
+ #define SUN6I_INT_CTL_TF_ERQ			BIT(4)
+@@ -260,6 +266,20 @@
+ 	}
+ 
+ 	sun6i_spi_write(sspi, SUN6I_CLK_CTL_REG, reg);
++
++	/*
++	 * Past a point the round trip of SCLK going out and the slave's data
++	 * coming back no longer fits in the setup time, so the sample point has
++	 * to move half a cycle later; slow buses want it moved the other way.
++	 * The thresholds are the ones the BSP driver uses.
++	 */
++	reg = sun6i_spi_read(sspi, SUN6I_TFR_CTL_REG);
++	reg &= ~(SUN6I_TFR_CTL_SDC | SUN6I_TFR_CTL_SDM);
++	if (speed_hz >= SUN6I_SPI_HIGH_FREQ)
++		reg |= SUN6I_TFR_CTL_SDC;
++	else if (speed_hz <= SUN6I_SPI_LOW_FREQ)
++		reg |= SUN6I_TFR_CTL_SDM;
++	sun6i_spi_write(sspi, SUN6I_TFR_CTL_REG, reg);
+ }
+ 
+ static void sun6i_spi_dma_rx_cb(void *param)

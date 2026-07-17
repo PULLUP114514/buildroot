@@ -1,0 +1,80 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] sunxi: spi: move the read sample point with the bus speed
+
+SPI_TCR has two bits controlling when the master samples MISO and the
+driver leaves both at zero regardless of speed. That is the right setting
+for the middle of the range, which is why it has never been noticed, but
+it does not hold at either end.
+
+Past roughly 60MHz the round trip -- SCLK propagating to the slave and its
+data coming back -- no longer fits inside the setup time, and SDC (bit 11)
+has to delay the sample point by half an SCLK cycle. Below roughly 24MHz
+the default delay is itself the problem and SDM (bit 13) selects plain
+sampling instead. F1C200s manual 7.3.7.2 documents both; the thresholds
+are the ones the BSP driver applies in sunxi_spi_mode_check().
+
+This is a prerequisite for raising the bus speed on suniv: the CDR2
+divider hangs off the 200MHz AHB, so the reachable rates are 100/50/33MHz
+and nothing in between. Asking for anything under 100 lands on 50, which
+sits in the no-adjustment window -- but 100MHz needs SDC.
+
+The bits live in the sun6i register layout only. sun4i has no equivalent,
+and leaving its bits[] entries unset makes both masks 0, so the
+read-modify-write is a no-op there.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+--- a/drivers/spi/spi-sunxi.c
++++ b/drivers/spi/spi-sunxi.c
+@@ -83,6 +83,10 @@
+ #define SUN4I_SPI_MIN_RATE		3000
+ #define SUN4I_SPI_TIMEOUT_US		1000000
+ 
++/* Speeds at which the read sample point has to move, as used by the BSP */
++#define SUN4I_SPI_HIGH_RATE		60000000
++#define SUN4I_SPI_LOW_RATE		24000000
++
+ #define SPI_REG(priv, reg)		((priv)->base + \
+ 					(priv)->variant->regs[reg])
+ #define SPI_BIT(priv, bit)		((priv)->variant->bits[bit])
+@@ -115,6 +119,9 @@
+ 	SPI_TCR_XCH,
+ 	SPI_TCR_CS_MANUAL,
+ 	SPI_TCR_CS_LEVEL,
++	/* Sample point control; sun4i has no equivalent and leaves these 0 */
++	SPI_TCR_SDC,
++	SPI_TCR_SDM,
+ 	SPI_FCR_TF_RST,
+ 	SPI_FCR_RF_RST,
+ 	SPI_FSR_RF_CNT_MASK,
+@@ -527,6 +534,21 @@
+ 	priv->freq = speed;
+ 	writel(reg, SPI_REG(priv, SPI_CCR));
+ 
++	/*
++	 * Past a point the round trip of SCLK going out and the slave's data
++	 * coming back no longer fits in the setup time, so the sample point
++	 * has to move half a cycle later; slow buses want it moved the other
++	 * way. The thresholds are the ones the BSP driver uses. On sun4i both
++	 * bits are 0, which leaves the register untouched.
++	 */
++	reg = readl(SPI_REG(priv, SPI_TCR));
++	reg &= ~(SPI_BIT(priv, SPI_TCR_SDC) | SPI_BIT(priv, SPI_TCR_SDM));
++	if (speed >= SUN4I_SPI_HIGH_RATE)
++		reg |= SPI_BIT(priv, SPI_TCR_SDC);
++	else if (speed <= SUN4I_SPI_LOW_RATE)
++		reg |= SPI_BIT(priv, SPI_TCR_SDM);
++	writel(reg, SPI_REG(priv, SPI_TCR));
++
+ 	return 0;
+ }
+ 
+@@ -667,6 +689,8 @@
+ 	[SPI_TCR_CS_MASK]	= 0x30,
+ 	[SPI_TCR_CS_MANUAL]	= BIT(6),
+ 	[SPI_TCR_CS_LEVEL]	= BIT(7),
++	[SPI_TCR_SDC]		= BIT(11),
++	[SPI_TCR_SDM]		= BIT(13),
+ 	[SPI_TCR_XCH]		= BIT(31),
+ 	[SPI_FCR_RF_RST]	= BIT(15),
+ 	[SPI_FCR_TF_RST]	= BIT(31),

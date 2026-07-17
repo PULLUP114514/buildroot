@@ -1,0 +1,39 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] sunxi: skip SATAPWR/MACPWR setup when the pin is unset
+
+SATAPWR and MACPWR are Kconfig strings. Leaving them blank still yields
+`#define CONFIG_SATAPWR ""`, which satisfies #ifdef, so board_init always
+runs the block: sunxi_name_to_gpio("") returns -1, both gpio calls fail,
+and mdelay(500) still happens.
+
+Only request, drive, and wait when the name resolves to a
+real pin -- the same approach mainline U-Boot uses.
+
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -261,15 +261,19 @@
+ 
+ #ifdef CONFIG_SATAPWR
+ 	satapwr_pin = sunxi_name_to_gpio(CONFIG_SATAPWR);
+-	gpio_request(satapwr_pin, "satapwr");
+-	gpio_direction_output(satapwr_pin, 1);
+-	/* Give attached sata device time to power-up to avoid link timeouts */
+-	mdelay(500);
++	if (satapwr_pin >= 0) {
++		gpio_request(satapwr_pin, "satapwr");
++		gpio_direction_output(satapwr_pin, 1);
++		/* Give attached sata device time to power-up to avoid link timeouts */
++		mdelay(500);
++	}
+ #endif
+ #ifdef CONFIG_MACPWR
+ 	macpwr_pin = sunxi_name_to_gpio(CONFIG_MACPWR);
+-	gpio_request(macpwr_pin, "macpwr");
+-	gpio_direction_output(macpwr_pin, 1);
++	if (macpwr_pin >= 0) {
++		gpio_request(macpwr_pin, "macpwr");
++		gpio_direction_output(macpwr_pin, 1);
++	}
+ #endif
+ 
+ #ifdef CONFIG_DM_I2C
