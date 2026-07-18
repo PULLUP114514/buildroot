@@ -1,0 +1,15 @@
+config BR2_PACKAGE_EPASS_TEST
+	bool "epass-test"
+	depends on BR2_TOOLCHAIN_HAS_THREADS # libdrm
+	select BR2_PACKAGE_LIBDRM
+	help
+	  epass hardware test tools:
+	  - drmtest: DRM/KMS screen pattern tester (fbtest
+	    equivalent). Draws SMPTE bars, gradients, grids and
+	    solid colors via legacy KMS + dumb buffers.
+	  - c8test: DEBE layer palette (C8/index) mode tester.
+	    Needs kernel patch 0029 (DRM_FORMAT_C8 +
+	    /sys/kernel/debe_palette/palette).
+
+comment "epass-test needs a toolchain w/ threads"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS

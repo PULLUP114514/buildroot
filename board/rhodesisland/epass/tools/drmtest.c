@@ -280,7 +280,7 @@ out_res:
 }
 
 /*
- * Buildroot 包: package/drmtest (BR2_PACKAGE_DRMTEST)
+ * Buildroot 包: package/epass-test (BR2_PACKAGE_EPASS_TEST)
  * 装到目标机 /usr/bin/drmtest
  *
  * 手工交叉编译 (在 buildroot 根目录):
