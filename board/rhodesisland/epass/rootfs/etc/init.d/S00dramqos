@@ -23,9 +23,9 @@ case "$1" in
         ;;
 esac
 
+# DEFE
 devmem $((DRAMC + 0x11c)) 32 0x30000000  # DEFE: QoS=3 ACS=15
 # DEBE要给够burst
 devmem $((DRAMC + 0x118)) 32 0x3000F000  # DEBE: QoS=3 ACS=15
-
-# 暂时不限制 VE 带宽
-# devmem $((DRAMC + 0x120)) 32 0x00000064  # VE:   BWL0=100MB/s
+# VE
+devmem $((DRAMC + 0x120)) 32 0x30000000
