@@ -1,0 +1,649 @@
+cedrus: suniv SDROT 硬件旋转 m2m 节点
+
+老 IP(VE 0x1663)的 MPEG 引擎带 SDROT 单元,可对 32x32 tiled NV12
+(ST12)整帧做 90/180/270 旋转。寄存器序列取自 Tina libvideoengine.so
+的 RotateHw1663:输入走 REC_LUMA/CHROMA(0x148/0x14c),输出走
+ROT_LUMA/CHROMA(0x1cc/0x1d0),尺寸 0x1b8,角度 0x1d4,
+CTRL=ROTATE_SCALE_OUT_EN|ROTATE_IRQ_EN|ERROR_IRQ_EN|FINISH_IRQ_EN,
+TRIGGER=(0x05<<24)|HW_ROTATE。
+
+注册为第二个 m2m video 节点(cedrus-rotate),与解码节点共用同一个
+m2m_dev:硬件互斥由 m2m 框架排队保证,中断分发复用 dec_ops 表
+(新槽位 CEDRUS_CODEC_ROTATE),cedrus_irq 不需要改。引擎选择走
+cedrus_engine_enable 的 MPEG case,自动带 sel_bias。
+
+普通 QBUF/STREAMON 流程,无 Request API;角度用标准 V4L2_CID_ROTATE
+(0/90/180/270)。两端格式均只有 ST12;src 传编码尺寸(宏块对齐),
+90/270 时 dst 宽高对调。chroma 平面偏移按解码输出布局
+stride*ALIGN(h,32) 计算,与 cedrus 解码节点写出的 buffer 直接对接
+(dmabuf 导入导出,零拷贝)。
+
+验证:v4l2-ctl -d /dev/video1 --set-ctrl rotate=90 后跑一帧,
+或解码输出 dmabuf 直接喂入。blob 每次旋转前有整机 VE reset,
+此处未做;若偶发挂死再补。
+
+--- a/drivers/staging/media/sunxi/cedrus/Makefile
++++ b/drivers/staging/media/sunxi/cedrus/Makefile
+@@ -2,4 +2,4 @@
+ obj-$(CONFIG_VIDEO_SUNXI_CEDRUS) += sunxi-cedrus.o
+ 
+ sunxi-cedrus-y = cedrus.o cedrus_video.o cedrus_hw.o cedrus_dec.o \
+-		 cedrus_mpeg2.o cedrus_h264.o
++		 cedrus_mpeg2.o cedrus_h264.o cedrus_rotate.o
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -41,6 +41,8 @@
+ enum cedrus_codec {
+ 	CEDRUS_CODEC_MPEG2,
+ 	CEDRUS_CODEC_H264,
++	/* 非解码:MPEG 引擎 SDROT 整帧旋转,只在 rotate 节点的 ctx 上使用 */
++	CEDRUS_CODEC_ROTATE,
+ 	CEDRUS_CODEC_LAST,
+ };
+ 
+@@ -124,6 +126,10 @@
+ 			dma_addr_t	intra_pred_buf_dma;
+ 			ssize_t		intra_pred_buf_size;
+ 		} h264;
++		struct {
++			/* 度数(0/90/180/270),s_ctrl 写入,device_run 读 */
++			unsigned int	angle;
++		} rotate;
+ 	} codec;
+ };
+ 
+@@ -146,6 +152,7 @@
+ struct cedrus_dev {
+ 	struct v4l2_device	v4l2_dev;
+ 	struct video_device	vfd;
++	struct video_device	vfd_rotate;
+ 	struct media_device	mdev;
+ 	struct media_pad	pad[2];
+ 	struct platform_device	*pdev;
+@@ -172,6 +179,11 @@
+ 
+ extern struct cedrus_dec_ops cedrus_dec_ops_mpeg2;
+ extern struct cedrus_dec_ops cedrus_dec_ops_h264;
++extern struct cedrus_dec_ops cedrus_dec_ops_rotate;
++
++int cedrus_release(struct file *file);
++int cedrus_rotate_register(struct cedrus_dev *dev);
++void cedrus_rotate_unregister(struct cedrus_dev *dev);
+ 
+ static inline void cedrus_write(struct cedrus_dev *dev, u32 reg, u32 val)
+ {
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -263,7 +263,8 @@
+ 	return ret;
+ }
+ 
+-static int cedrus_release(struct file *file)
++/* rotate 节点的 fops 复用(rotate ctx 的 ctrls 为 NULL,kfree 可空) */
++int cedrus_release(struct file *file)
+ {
+ 	struct cedrus_dev *dev = video_drvdata(file);
+ 	struct cedrus_ctx *ctx = container_of(file->private_data,
+@@ -343,6 +344,7 @@
+ 
+ 	dev->dec_ops[CEDRUS_CODEC_MPEG2] = &cedrus_dec_ops_mpeg2;
+ 	dev->dec_ops[CEDRUS_CODEC_H264] = &cedrus_dec_ops_h264;
++	dev->dec_ops[CEDRUS_CODEC_ROTATE] = &cedrus_dec_ops_rotate;
+ 
+ 	mutex_init(&dev->dev_mutex);
+ 
+@@ -400,10 +402,16 @@
+ 		goto err_m2m_mc;
+ 	}
+ 
++	ret = cedrus_rotate_register(dev);
++	if (ret)
++		goto err_mdev;
++
+ 	platform_set_drvdata(pdev, dev);
+ 
+ 	return 0;
+ 
++err_mdev:
++	media_device_unregister(&dev->mdev);
+ err_m2m_mc:
+ 	v4l2_m2m_unregister_media_controller(dev->m2m_dev);
+ err_video:
+@@ -426,6 +434,7 @@
+ 		media_device_cleanup(&dev->mdev);
+ 	}
+ 
++	cedrus_rotate_unregister(dev);
+ 	v4l2_m2m_release(dev->m2m_dev);
+ 	video_unregister_device(&dev->vfd);
+ 	v4l2_device_unregister(&dev->v4l2_dev);
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -47,6 +47,7 @@
+ 
+ 	switch (codec) {
+ 	case CEDRUS_CODEC_MPEG2:
++	case CEDRUS_CODEC_ROTATE:
+ 		reg |= VE_MODE_DEC_MPEG;
+ 		break;
+ 
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -205,6 +205,7 @@
+ #define VE_DEC_MPEG_STATUS_VLD_DATA_REQ		BIT(2)
+ #define VE_DEC_MPEG_STATUS_ERROR		BIT(1)
+ #define VE_DEC_MPEG_STATUS_SUCCESS		BIT(0)
++#define VE_DEC_MPEG_STATUS_ROTATE_CLEAR_MASK	GENMASK(3, 0)
+ #define VE_DEC_MPEG_STATUS_CHECK_MASK \
+ 	(VE_DEC_MPEG_STATUS_SUCCESS | VE_DEC_MPEG_STATUS_ERROR | \
+ 	 VE_DEC_MPEG_STATUS_VLD_DATA_REQ)
+@@ -242,11 +243,20 @@
+ #define VE_DEC_MPEG_IQMINPUT_WEIGHT(i, v) \
+ 	(SHIFT_AND_MASK_BITS(i, 13, 8) | SHIFT_AND_MASK_BITS(v, 7, 0))
+ 
++/* SDROT 独立旋转任务的输入图像尺寸(宏块数-1),blob RotateHw1663 序列 */
++#define VE_DEC_MPEG_SDROT_SIZE			(VE_ENGINE_DEC_MPEG + 0xb8)
++#define VE_DEC_MPEG_SDROT_SIZE_MB(w, h) \
++	((DIV_ROUND_UP(w, 16) - 1) | (DIV_ROUND_UP(h, 16) - 1) << 16)
++
+ #define VE_DEC_MPEG_ERROR			(VE_ENGINE_DEC_MPEG + 0xc4)
+ #define VE_DEC_MPEG_CRTMBADDR			(VE_ENGINE_DEC_MPEG + 0xc8)
+ #define VE_DEC_MPEG_ROT_LUMA			(VE_ENGINE_DEC_MPEG + 0xcc)
+ #define VE_DEC_MPEG_ROT_CHROMA			(VE_ENGINE_DEC_MPEG + 0xd0)
+ 
++#define VE_DEC_MPEG_SDROT_CTRL			(VE_ENGINE_DEC_MPEG + 0xd4)
++/* [1:0] 角度,单位 90 度;blob 只用这两位,mirror 位存在与否未探明 */
++#define VE_DEC_MPEG_SDROT_CTRL_ANGLE(deg)	(((deg) / 90) & 0x3)
++
+ #define VE_H264_SPS			0x200
+ #define VE_H264_SPS_MBS_ONLY			BIT(18)
+ #define VE_H264_SPS_MB_ADAPTIVE_FRAME_FIELD	BIT(17)
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_rotate.c
+@@ -0,0 +1,486 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Cedrus VPU driver — suniv (VE 0x1663) SDROT rotate node
++ *
++ * 老 IP 的 MPEG 引擎自带 Scale-Down/Rotate 单元,能对 32x32 tiled
++ * NV12(ST12)整帧做 90/180/270 旋转。寄存器序列取自 Tina
++ * libvideoengine.so 的 RotateHw1663。
++ *
++ * 以第二个 m2m video 节点注册,与解码节点共用同一个 m2m_dev,
++ * 由 m2m 框架保证与解码任务在 VE 上串行。普通 QBUF/STREAMON 流程,
++ * 不走 Request API;角度用标准控制项 V4L2_CID_ROTATE。
++ */
++
++#include <media/v4l2-device.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "cedrus.h"
++#include "cedrus_hw.h"
++#include "cedrus_regs.h"
++
++#define CEDRUS_ROTATE_NAME	"cedrus-rotate"
++
++#define CEDRUS_ROTATE_MIN_SIZE	16U
++#define CEDRUS_ROTATE_MAX_SIZE	3840U
++
++static inline struct cedrus_ctx *cedrus_rotate_file2ctx(struct file *file)
++{
++	return container_of(file->private_data, struct cedrus_ctx, fh);
++}
++
++/*
++ * 宽高对齐到 16(宏块粒度,决定尺寸寄存器),buffer 布局按解码输出的
++ * ST12 约定:stride 32 对齐,chroma 平面起点在 stride * ALIGN(h, 32),
++ * chroma 平面按整 tile 行(64 行亮度对应 32 行色度)补齐。
++ * 传编码尺寸(非 32 对齐)时 chroma 偏移与解码器写出的一致。
++ */
++static void cedrus_rotate_prepare_format(struct v4l2_pix_format *pix_fmt)
++{
++	unsigned int width = pix_fmt->width;
++	unsigned int height = pix_fmt->height;
++
++	width = clamp(width, CEDRUS_ROTATE_MIN_SIZE, CEDRUS_ROTATE_MAX_SIZE);
++	height = clamp(height, CEDRUS_ROTATE_MIN_SIZE, CEDRUS_ROTATE_MAX_SIZE);
++	width = ALIGN(width, 16);
++	height = ALIGN(height, 16);
++
++	pix_fmt->pixelformat = V4L2_PIX_FMT_SUNXI_TILED_NV12;
++	pix_fmt->field = V4L2_FIELD_NONE;
++	pix_fmt->width = width;
++	pix_fmt->height = height;
++	pix_fmt->bytesperline = ALIGN(width, 32);
++	pix_fmt->sizeimage = pix_fmt->bytesperline * ALIGN(height, 32) +
++			     pix_fmt->bytesperline * ALIGN(height, 64) / 2;
++}
++
++static inline u32 cedrus_rotate_chroma_offset(struct v4l2_pix_format *pix_fmt)
++{
++	return pix_fmt->bytesperline * ALIGN(pix_fmt->height, 32);
++}
++
++/* dec_ops */
++
++static void cedrus_rotate_irq_clear(struct cedrus_ctx *ctx)
++{
++	cedrus_write(ctx->dev, VE_DEC_MPEG_STATUS,
++		     VE_DEC_MPEG_STATUS_ROTATE_CLEAR_MASK);
++}
++
++static void cedrus_rotate_irq_disable(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	u32 reg = cedrus_read(dev, VE_DEC_MPEG_CTRL);
++
++	reg &= ~(VE_DEC_MPEG_CTRL_ROTATE_IRQ_EN |
++		 VE_DEC_MPEG_CTRL_ERROR_IRQ_EN |
++		 VE_DEC_MPEG_CTRL_FINISH_IRQ_EN);
++
++	cedrus_write(dev, VE_DEC_MPEG_CTRL, reg);
++}
++
++static enum cedrus_irq_status cedrus_rotate_irq_status(struct cedrus_ctx *ctx)
++{
++	u32 reg = cedrus_read(ctx->dev, VE_DEC_MPEG_STATUS);
++
++	if (reg & VE_DEC_MPEG_STATUS_ERROR)
++		return CEDRUS_IRQ_ERROR;
++
++	if (reg & VE_DEC_MPEG_STATUS_ROTATE_SUCCESS)
++		return CEDRUS_IRQ_OK;
++
++	return CEDRUS_IRQ_NONE;
++}
++
++static void cedrus_rotate_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	struct v4l2_pix_format *src_fmt = &ctx->src_fmt;
++	struct v4l2_pix_format *dst_fmt = &ctx->dst_fmt;
++	dma_addr_t src_luma =
++		vb2_dma_contig_plane_dma_addr(&run->src->vb2_buf, 0);
++	dma_addr_t dst_luma =
++		vb2_dma_contig_plane_dma_addr(&run->dst->vb2_buf, 0);
++
++	cedrus_engine_enable(dev, CEDRUS_CODEC_ROTATE);
++
++	cedrus_write(dev, VE_DEC_MPEG_SDROT_SIZE,
++		     VE_DEC_MPEG_SDROT_SIZE_MB(src_fmt->width,
++					       src_fmt->height));
++
++	cedrus_write(dev, VE_DEC_MPEG_REC_LUMA, src_luma);
++	cedrus_write(dev, VE_DEC_MPEG_REC_CHROMA,
++		     src_luma + cedrus_rotate_chroma_offset(src_fmt));
++	cedrus_write(dev, VE_DEC_MPEG_ROT_LUMA, dst_luma);
++	cedrus_write(dev, VE_DEC_MPEG_ROT_CHROMA,
++		     dst_luma + cedrus_rotate_chroma_offset(dst_fmt));
++
++	cedrus_write(dev, VE_DEC_MPEG_SDROT_CTRL,
++		     VE_DEC_MPEG_SDROT_CTRL_ANGLE(ctx->codec.rotate.angle));
++
++	cedrus_write(dev, VE_DEC_MPEG_CTRL,
++		     VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN |
++		     VE_DEC_MPEG_CTRL_ROTATE_IRQ_EN |
++		     VE_DEC_MPEG_CTRL_ERROR_IRQ_EN |
++		     VE_DEC_MPEG_CTRL_FINISH_IRQ_EN);
++
++	cedrus_rotate_irq_clear(ctx);
++}
++
++static void cedrus_rotate_trigger(struct cedrus_ctx *ctx)
++{
++	/* 高字节 0x05 照抄 blob 的字节写序列,含义未知,勿省 */
++	cedrus_write(ctx->dev, VE_DEC_MPEG_TRIGGER,
++		     (0x05 << 24) | VE_DEC_MPEG_TRIGGER_HW_ROTATE);
++}
++
++struct cedrus_dec_ops cedrus_dec_ops_rotate = {
++	.irq_clear	= cedrus_rotate_irq_clear,
++	.irq_disable	= cedrus_rotate_irq_disable,
++	.irq_status	= cedrus_rotate_irq_status,
++	.setup		= cedrus_rotate_setup,
++	.trigger	= cedrus_rotate_trigger,
++};
++
++/* 控制项 */
++
++static int cedrus_rotate_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct cedrus_ctx *ctx =
++		container_of(ctrl->handler, struct cedrus_ctx, hdl);
++
++	if (ctrl->id != V4L2_CID_ROTATE)
++		return -EINVAL;
++
++	ctx->codec.rotate.angle = ctrl->val;
++
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops cedrus_rotate_ctrl_ops = {
++	.s_ctrl		= cedrus_rotate_s_ctrl,
++};
++
++/* ioctl */
++
++static int cedrus_rotate_querycap(struct file *file, void *priv,
++				  struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, CEDRUS_NAME, sizeof(cap->driver));
++	strscpy(cap->card, CEDRUS_ROTATE_NAME, sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info),
++		 "platform:%s", CEDRUS_NAME);
++
++	return 0;
++}
++
++static int cedrus_rotate_enum_fmt(struct file *file, void *priv,
++				  struct v4l2_fmtdesc *f)
++{
++	if (f->index != 0)
++		return -EINVAL;
++
++	f->pixelformat = V4L2_PIX_FMT_SUNXI_TILED_NV12;
++
++	return 0;
++}
++
++static int cedrus_rotate_g_fmt_vid_cap(struct file *file, void *priv,
++				       struct v4l2_format *f)
++{
++	f->fmt.pix = cedrus_rotate_file2ctx(file)->dst_fmt;
++
++	return 0;
++}
++
++static int cedrus_rotate_g_fmt_vid_out(struct file *file, void *priv,
++				       struct v4l2_format *f)
++{
++	f->fmt.pix = cedrus_rotate_file2ctx(file)->src_fmt;
++
++	return 0;
++}
++
++static int cedrus_rotate_try_fmt(struct file *file, void *priv,
++				 struct v4l2_format *f)
++{
++	cedrus_rotate_prepare_format(&f->fmt.pix);
++
++	return 0;
++}
++
++static int cedrus_rotate_s_fmt(struct file *file, void *priv,
++			       struct v4l2_format *f)
++{
++	struct cedrus_ctx *ctx = cedrus_rotate_file2ctx(file);
++	struct vb2_queue *vq;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	cedrus_rotate_prepare_format(&f->fmt.pix);
++
++	if (V4L2_TYPE_IS_OUTPUT(f->type))
++		ctx->src_fmt = f->fmt.pix;
++	else
++		ctx->dst_fmt = f->fmt.pix;
++
++	return 0;
++}
++
++static const struct v4l2_ioctl_ops cedrus_rotate_ioctl_ops = {
++	.vidioc_querycap		= cedrus_rotate_querycap,
++
++	.vidioc_enum_fmt_vid_cap	= cedrus_rotate_enum_fmt,
++	.vidioc_g_fmt_vid_cap		= cedrus_rotate_g_fmt_vid_cap,
++	.vidioc_try_fmt_vid_cap		= cedrus_rotate_try_fmt,
++	.vidioc_s_fmt_vid_cap		= cedrus_rotate_s_fmt,
++
++	.vidioc_enum_fmt_vid_out	= cedrus_rotate_enum_fmt,
++	.vidioc_g_fmt_vid_out		= cedrus_rotate_g_fmt_vid_out,
++	.vidioc_try_fmt_vid_out		= cedrus_rotate_try_fmt,
++	.vidioc_s_fmt_vid_out		= cedrus_rotate_s_fmt,
++
++	.vidioc_reqbufs			= v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf		= v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf			= v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf			= v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf		= v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs		= v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf			= v4l2_m2m_ioctl_expbuf,
++
++	.vidioc_streamon		= v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff		= v4l2_m2m_ioctl_streamoff,
++};
++
++/* vb2 */
++
++static int cedrus_rotate_queue_setup(struct vb2_queue *vq,
++				     unsigned int *nbufs,
++				     unsigned int *nplanes,
++				     unsigned int sizes[],
++				     struct device *alloc_devs[])
++{
++	struct cedrus_ctx *ctx = vb2_get_drv_priv(vq);
++	struct v4l2_pix_format *pix_fmt;
++
++	if (V4L2_TYPE_IS_OUTPUT(vq->type))
++		pix_fmt = &ctx->src_fmt;
++	else
++		pix_fmt = &ctx->dst_fmt;
++
++	if (!pix_fmt->sizeimage)
++		return -EINVAL;
++
++	if (*nplanes) {
++		if (sizes[0] < pix_fmt->sizeimage)
++			return -EINVAL;
++	} else {
++		sizes[0] = pix_fmt->sizeimage;
++		*nplanes = 1;
++	}
++
++	return 0;
++}
++
++static int cedrus_rotate_buf_prepare(struct vb2_buffer *vb)
++{
++	struct cedrus_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_pix_format *pix_fmt;
++
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
++		pix_fmt = &ctx->src_fmt;
++	else
++		pix_fmt = &ctx->dst_fmt;
++
++	if (vb2_plane_size(vb, 0) < pix_fmt->sizeimage)
++		return -EINVAL;
++
++	vb2_set_plane_payload(vb, 0, pix_fmt->sizeimage);
++
++	return 0;
++}
++
++static int cedrus_rotate_buf_out_validate(struct vb2_buffer *vb)
++{
++	to_vb2_v4l2_buffer(vb)->field = V4L2_FIELD_NONE;
++
++	return 0;
++}
++
++static void cedrus_rotate_buf_queue(struct vb2_buffer *vb)
++{
++	struct cedrus_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++}
++
++static void cedrus_rotate_stop_streaming(struct vb2_queue *vq)
++{
++	struct cedrus_ctx *ctx = vb2_get_drv_priv(vq);
++	struct vb2_v4l2_buffer *vbuf;
++
++	for (;;) {
++		if (V4L2_TYPE_IS_OUTPUT(vq->type))
++			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++		else
++			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++
++		if (!vbuf)
++			return;
++
++		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
++	}
++}
++
++static struct vb2_ops cedrus_rotate_qops = {
++	.queue_setup		= cedrus_rotate_queue_setup,
++	.buf_prepare		= cedrus_rotate_buf_prepare,
++	.buf_queue		= cedrus_rotate_buf_queue,
++	.buf_out_validate	= cedrus_rotate_buf_out_validate,
++	.stop_streaming		= cedrus_rotate_stop_streaming,
++	.wait_prepare		= vb2_ops_wait_prepare,
++	.wait_finish		= vb2_ops_wait_finish,
++};
++
++static int cedrus_rotate_queue_init(void *priv, struct vb2_queue *src_vq,
++				    struct vb2_queue *dst_vq)
++{
++	struct cedrus_ctx *ctx = priv;
++	int ret;
++
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	src_vq->drv_priv = ctx;
++	src_vq->buf_struct_size = sizeof(struct cedrus_buffer);
++	src_vq->min_buffers_needed = 1;
++	src_vq->ops = &cedrus_rotate_qops;
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src_vq->lock = &ctx->dev->dev_mutex;
++	src_vq->dev = ctx->dev->dev;
++
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst_vq->drv_priv = ctx;
++	dst_vq->buf_struct_size = sizeof(struct cedrus_buffer);
++	dst_vq->min_buffers_needed = 1;
++	dst_vq->ops = &cedrus_rotate_qops;
++	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst_vq->lock = &ctx->dev->dev_mutex;
++	dst_vq->dev = ctx->dev->dev;
++
++	return vb2_queue_init(dst_vq);
++}
++
++/* 文件操作与注册 */
++
++static int cedrus_rotate_open(struct file *file)
++{
++	struct cedrus_dev *dev = video_drvdata(file);
++	struct cedrus_ctx *ctx;
++	int ret;
++
++	if (mutex_lock_interruptible(&dev->dev_mutex))
++		return -ERESTARTSYS;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx) {
++		mutex_unlock(&dev->dev_mutex);
++		return -ENOMEM;
++	}
++
++	v4l2_fh_init(&ctx->fh, video_devdata(file));
++	file->private_data = &ctx->fh;
++	ctx->dev = dev;
++	ctx->current_codec = CEDRUS_CODEC_ROTATE;
++
++	v4l2_ctrl_handler_init(&ctx->hdl, 1);
++	v4l2_ctrl_new_std(&ctx->hdl, &cedrus_rotate_ctrl_ops,
++			  V4L2_CID_ROTATE, 0, 270, 90, 0);
++	if (ctx->hdl.error) {
++		ret = ctx->hdl.error;
++		goto err_free;
++	}
++
++	ctx->fh.ctrl_handler = &ctx->hdl;
++	v4l2_ctrl_handler_setup(&ctx->hdl);
++
++	cedrus_rotate_prepare_format(&ctx->src_fmt);
++	cedrus_rotate_prepare_format(&ctx->dst_fmt);
++
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx,
++					    &cedrus_rotate_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_ctrls;
++	}
++
++	v4l2_fh_add(&ctx->fh);
++
++	mutex_unlock(&dev->dev_mutex);
++
++	return 0;
++
++err_ctrls:
++	v4l2_ctrl_handler_free(&ctx->hdl);
++err_free:
++	kfree(ctx);
++	mutex_unlock(&dev->dev_mutex);
++
++	return ret;
++}
++
++static const struct v4l2_file_operations cedrus_rotate_fops = {
++	.owner		= THIS_MODULE,
++	.open		= cedrus_rotate_open,
++	.release	= cedrus_release,
++	.poll		= v4l2_m2m_fop_poll,
++	.unlocked_ioctl	= video_ioctl2,
++	.mmap		= v4l2_m2m_fop_mmap,
++};
++
++static const struct video_device cedrus_rotate_video_device = {
++	.name		= CEDRUS_ROTATE_NAME,
++	.vfl_dir	= VFL_DIR_M2M,
++	.fops		= &cedrus_rotate_fops,
++	.ioctl_ops	= &cedrus_rotate_ioctl_ops,
++	.minor		= -1,
++	.release	= video_device_release_empty,
++	.device_caps	= V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING,
++};
++
++int cedrus_rotate_register(struct cedrus_dev *dev)
++{
++	struct video_device *vfd = &dev->vfd_rotate;
++	int ret;
++
++	*vfd = cedrus_rotate_video_device;
++	vfd->lock = &dev->dev_mutex;
++	vfd->v4l2_dev = &dev->v4l2_dev;
++	video_set_drvdata(vfd, dev);
++
++	ret = video_register_device(vfd, VFL_TYPE_GRABBER, -1);
++	if (ret) {
++		v4l2_err(&dev->v4l2_dev,
++			 "Failed to register rotate video device\n");
++		return ret;
++	}
++
++	v4l2_info(&dev->v4l2_dev,
++		  "Rotate device registered as /dev/video%d\n", vfd->num);
++
++	return 0;
++}
++
++void cedrus_rotate_unregister(struct cedrus_dev *dev)
++{
++	video_unregister_device(&dev->vfd_rotate);
++}

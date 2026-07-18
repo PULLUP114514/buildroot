@@ -1,0 +1,295 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sun4i: expose DEBE layer palette (C8) mode
+
+The suniv DEBE layers support an indexed working mode (ATT_CTRL_REG0
+bits [23:22] = 01): the framebuffer is treated as indices into an
+on-chip 256 x ARGB8888 palette SRAM at register offset 0x1000, and the
+existing 8BPP FBFMT encoding selects 8-bit indices.  An 8bpp UI layer
+halves the DRAM read bandwidth of RGB565 and each palette entry carries
+its own alpha.  Linux 5.4 only has the C8 fourcc (no C1/C2/C4), so only
+the 8bpp variant is exposed.
+
+Wire DRM_FORMAT_C8 into the backend format tables and set/clear the
+WORKMOD field alongside FBFMT.  The clear is also added to
+sun4i_backend_cleanup_layer() because the frontend path never goes
+through update_layer_formats and would otherwise inherit a stale
+palette-mode bit.  The layer FB address and line width are already
+programmed in bit units, so the buffer path needs no changes.
+
+C8 is reported as having alpha in atomic_check so that a C8 overlay is
+assigned to the second pipe and its per-entry alpha reaches the alpha
+blender; the cost is that a C8 plane always counts against the alpha
+plane budget even with a fully opaque palette.  Scaled C8 is rejected
+(the frontend has no palette support) and C8 never selects the
+frontend since sun4i_frontend_format_is_supported() does not list it.
+
+The palette is uploaded through /sys/kernel/debe_palette/palette, a
+1024-byte binary file of little-endian ARGB8888 words (mirroring the
+battery_hwc sysfs approach).  Word-aligned partial writes are allowed
+and latched immediately via sun4i_backend_commit(); there is no vsync
+synchronization, so mid-scanout palette swaps may tear for one frame.
+The SRAM is a single instance shared by all four layers.  It is
+initialized to an opaque grayscale ramp so C8 scanout is usable before
+the first upload.
+
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -35,6 +35,7 @@
+ #include <linux/mutex.h>
+ #include <linux/of_address.h>
+ #include <linux/sysfs.h>
++#include <asm/unaligned.h>
+ 
+ static DEFINE_MUTEX(srgn_splash_lock);
+ 
+@@ -109,6 +110,11 @@
+ 		*mode = SUN4I_BACKEND_LAY_FBFMT_ARGB8888;
+ 		break;
+ 
++	case DRM_FORMAT_C8:
++		/* in WORKMOD_PALETTE the 8BPP encoding means 8-bit index */
++		*mode = SUN4I_BACKEND_LAY_FBFMT_8BPP;
++		break;
++
+ 	case DRM_FORMAT_ARGB4444:
+ 		*mode = SUN4I_BACKEND_LAY_FBFMT_ARGB4444;
+ 		break;
+@@ -148,6 +154,7 @@
+ 	DRM_FORMAT_ARGB1555,
+ 	DRM_FORMAT_ARGB4444,
+ 	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_C8,
+ 	DRM_FORMAT_RGB565,
+ 	DRM_FORMAT_RGB888,
+ 	DRM_FORMAT_RGBA4444,
+@@ -295,6 +302,13 @@
+ 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_EN,
+ 			   val);
+ 
++	regmap_update_bits(backend->engine.regs,
++			   SUN4I_BACKEND_ATTCTL_REG0(layer),
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_MASK,
++			   fb->format->format == DRM_FORMAT_C8 ?
++				SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_PALETTE :
++				SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_NORMAL);
++
+ 	if (fb->format->is_yuv)
+ 		return sun4i_backend_update_yuv_format(backend, layer, plane);
+ 
+@@ -419,7 +433,14 @@
+ 	regmap_update_bits(backend->engine.regs,
+ 			   SUN4I_BACKEND_ATTCTL_REG0(layer),
+ 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_VDOEN |
+-			   SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN, 0);
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN |
++			   SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_MASK, 0);
++}
++
++static bool sun4i_backend_format_has_alpha(const struct drm_framebuffer *fb)
++{
++	/* palette entries carry per-entry alpha, treat C8 as per-pixel alpha */
++	return fb->format->has_alpha || fb->format->format == DRM_FORMAT_C8;
+ }
+ 
+ static bool sun4i_backend_plane_uses_scaler(struct drm_plane_state *state)
+@@ -544,7 +565,8 @@
+ 		DRM_DEBUG_DRIVER("Plane FB format is %s\n",
+ 				 drm_get_format_name(fb->format->format,
+ 						     &format_name));
+-		if (fb->format->has_alpha || (plane_state->alpha != DRM_BLEND_ALPHA_OPAQUE))
++		if (sun4i_backend_format_has_alpha(fb) ||
++		    (plane_state->alpha != DRM_BLEND_ALPHA_OPAQUE))
+ 			num_alpha_planes++;
+ 
+ 		DRM_DEBUG_DRIVER("Plane zpos is %d\n",
+@@ -616,7 +638,8 @@
+ 		 * The only alpha position is the lowest plane of the
+ 		 * second pipe.
+ 		 */
+-		if (fb->format->has_alpha || (p_state->alpha != DRM_BLEND_ALPHA_OPAQUE))
++		if (sun4i_backend_format_has_alpha(fb) ||
++		    (p_state->alpha != DRM_BLEND_ALPHA_OPAQUE))
+ 			current_pipe++;
+ 
+ 		s_state->pipe = current_pipe;
+@@ -1309,6 +1332,120 @@
+ 	mutex_unlock(&bat_hwc_lock);
+ }
+ 
++/*
++ * DEBE layer palette (index/C8 mode) upload.
++ *
++ * The palette SRAM at 0x1000-0x13ff holds 256 ARGB8888 entries shared by
++ * all four layers; a layer looks it up when its framebuffer is
++ * DRM_FORMAT_C8 (ATTCTL_REG0 WORKMOD_PALETTE).  Exposed to userspace as
++ * /sys/kernel/debe_palette/palette, a 1024-byte binary file of
++ * little-endian ARGB8888 words.  Writes must be word-aligned; partial
++ * updates are latched immediately (no vsync synchronization).
++ */
++struct debe_palette {
++	struct sun4i_backend	*backend;
++	struct kobject		*kobj;
++	u8			shadow[SUN4I_BACKEND_LAY_PALETTE_SIZE];
++};
++
++static struct debe_palette debe_pal;
++static DEFINE_MUTEX(debe_pal_lock);
++
++static ssize_t debe_palette_read(struct file *file, struct kobject *kobj,
++				 struct bin_attribute *attr, char *buf,
++				 loff_t off, size_t count)
++{
++	mutex_lock(&debe_pal_lock);
++	memcpy(buf, debe_pal.shadow + off, count);
++	mutex_unlock(&debe_pal_lock);
++
++	return count;
++}
++
++static ssize_t debe_palette_write(struct file *file, struct kobject *kobj,
++				  struct bin_attribute *attr, char *buf,
++				  loff_t off, size_t count)
++{
++	struct sun4i_backend *backend;
++	size_t i;
++
++	if ((off | count) & 3)
++		return -EINVAL;
++
++	mutex_lock(&debe_pal_lock);
++	backend = debe_pal.backend;
++	if (!backend) {
++		mutex_unlock(&debe_pal_lock);
++		return -ENODEV;
++	}
++
++	memcpy(debe_pal.shadow + off, buf, count);
++	for (i = 0; i < count; i += 4)
++		regmap_write(backend->engine.regs,
++			     SUN4I_BACKEND_LAY_PALETTE_OFF + off + i,
++			     get_unaligned_le32(buf + i));
++	sun4i_backend_commit(&backend->engine);
++	mutex_unlock(&debe_pal_lock);
++
++	return count;
++}
++
++static struct bin_attribute debe_palette_battr = {
++	.attr	= { .name = "palette", .mode = 0644 },
++	.size	= SUN4I_BACKEND_LAY_PALETTE_SIZE,
++	.read	= debe_palette_read,
++	.write	= debe_palette_write,
++};
++
++static void debe_palette_init(struct device *dev, struct sun4i_backend *backend)
++{
++	int i;
++
++	mutex_lock(&debe_pal_lock);
++	if (debe_pal.backend) {		/* only the first backend owns it */
++		mutex_unlock(&debe_pal_lock);
++		return;
++	}
++	debe_pal.backend = backend;
++
++	/* opaque grayscale ramp so C8 scanout is usable before any upload */
++	for (i = 0; i < SUN4I_BACKEND_LAY_PALETTE_SIZE / 4; i++) {
++		u32 val = 0xff000000 | (i * 0x010101);
++
++		put_unaligned_le32(val, debe_pal.shadow + i * 4);
++		regmap_write(backend->engine.regs,
++			     SUN4I_BACKEND_LAY_PALETTE_OFF + i * 4, val);
++	}
++	mutex_unlock(&debe_pal_lock);
++
++	debe_pal.kobj = kobject_create_and_add("debe_palette", kernel_kobj);
++	if (!debe_pal.kobj) {
++		dev_warn(dev, "debe_palette: could not create sysfs dir\n");
++		return;
++	}
++	if (sysfs_create_bin_file(debe_pal.kobj, &debe_palette_battr)) {
++		dev_warn(dev, "debe_palette: could not create sysfs file\n");
++		kobject_put(debe_pal.kobj);
++		debe_pal.kobj = NULL;
++	}
++}
++
++static void debe_palette_fini(struct sun4i_backend *backend)
++{
++	mutex_lock(&debe_pal_lock);
++	if (debe_pal.backend != backend) {
++		mutex_unlock(&debe_pal_lock);
++		return;
++	}
++	if (debe_pal.kobj) {
++		sysfs_remove_bin_file(debe_pal.kobj, &debe_palette_battr);
++		kobject_put(debe_pal.kobj);
++		debe_pal.kobj = NULL;
++	}
++	debe_pal.backend = NULL;
++	mutex_unlock(&debe_pal_lock);
++}
++
+ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 			      void *data)
+ {
+@@ -1471,6 +1608,7 @@
+ 	}
+ 
+ 	battery_hwc_init(dev, backend);
++	debe_palette_init(dev, backend);
+ 
+ 	backend->quirks = quirks;
+ 
+@@ -1492,6 +1630,7 @@
+ {
+ 	struct sun4i_backend *backend = dev_get_drvdata(dev);
+ 
++	debe_palette_fini(backend);
+ 	battery_hwc_fini(backend);
+ 
+ 	list_del(&backend->engine.list);
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -66,6 +66,9 @@
+ #define SUN4I_BACKEND_ATTCTL_REG0(l)		(0x890 + (0x4 * (l)))
+ #define SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_MASK	GENMASK(31, 24)
+ #define SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA(x)		((x) << 24)
++#define SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_MASK	GENMASK(23, 22)
++#define SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_NORMAL		(0 << 22)
++#define SUN4I_BACKEND_ATTCTL_REG0_LAY_WORKMOD_PALETTE		(1 << 22)
+ #define SUN4I_BACKEND_ATTCTL_REG0_LAY_PIPESEL_MASK	BIT(15)
+ #define SUN4I_BACKEND_ATTCTL_REG0_LAY_PIPESEL(x)		((x) << 15)
+ #define SUN4I_BACKEND_ATTCTL_REG0_LAY_PRISEL_MASK	GENMASK(11, 10)
+@@ -156,6 +159,13 @@
+ #define SUN4I_BACKEND_SPRADD_REG(s)		(0xc00 + (0x4 * (s)))
+ #define SUN4I_BACKEND_SPRLINEWIDTH_REG(s)	(0xd00 + (0x4 * (s)))
+ 
++/*
++ * suniv/F1C layer palette SRAM (UM 5.3.5.57), 256 x ARGB8888 entries,
++ * used by layers in WORKMOD_PALETTE.  Distinct from the sprite palette.
++ */
++#define SUN4I_BACKEND_LAY_PALETTE_OFF		0x1000
++#define SUN4I_BACKEND_LAY_PALETTE_SIZE		0x400
++
+ #define SUN4I_BACKEND_SPRPALTAB_OFF		0x4000
+ #define SUN4I_BACKEND_GAMMATAB_OFF		0x4400
+ #define SUN4I_BACKEND_HWCPATTERN_OFF		0x4800
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -142,6 +142,7 @@
+ 	DRM_FORMAT_ARGB4444,
+ 	DRM_FORMAT_ARGB1555,
+ 	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_C8,
+ 	DRM_FORMAT_RGBA5551,
+ 	DRM_FORMAT_RGBA4444,
+ 	DRM_FORMAT_RGB888,
+@@ -169,6 +170,7 @@
+ 	DRM_FORMAT_ARGB8888,
+ 	DRM_FORMAT_ARGB4444,
+ 	DRM_FORMAT_ARGB1555,
++	DRM_FORMAT_C8,
+ 	DRM_FORMAT_RGBA5551,
+ 	DRM_FORMAT_RGBA4444,
+ 	DRM_FORMAT_RGB888,
